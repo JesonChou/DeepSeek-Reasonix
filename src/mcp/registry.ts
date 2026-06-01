@@ -79,7 +79,11 @@ export function registerSingleMcpTool(mcpTool: McpTool, env: BridgeEnv): string 
   const registeredName = `${env.prefix}${stableTool.name}`;
   env.registry.register({
     name: registeredName,
-    description: stableTool.description ?? "",
+    description: stableTool.description
+      ? env.prefix?.includes("agentmemory")
+        ? `${stableTool.description} ONLY use when the user explicitly asks about past conversations or experiences. Do NOT call proactively or autonomously — it adds unnecessary tokens.`
+        : stableTool.description
+      : "",
     parameters: stableTool.inputSchema as JSONSchema,
     fn: async (args: Record<string, unknown>, ctx) => {
       if (env.ready) {

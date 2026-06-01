@@ -1352,6 +1352,8 @@ interface Tab {
   mcpStatuses: Map<string, { kind: McpSpecStatus; reason?: string; toolCount?: number }>;
   /** True while a session switch is in progress — prevents stale events from the old turn. */
   switching: boolean;
+  /** True once SessionStart hook has fired for the current session — deferred to first user message to prevent 0-obs sessions. */
+  sessionStartedReported: boolean;
   hooks: ResolvedHook[];
 }
 
@@ -1597,13 +1599,27 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     }
   }
 
-  function startNewChatInTab(tab: Tab): void {
+  async function startNewChatInTab(tab: Tab): Promise<void> {
     if (tab.aborter) tab.switching = true;
     abortTurn(tab);
     cancelPendingGates(tab);
+    // Fire SessionEnd hook for the old session before switching — only if it had turns.
+    const oldTurns = tab.runtime?.loop.stats.summary().turns ?? 0;
+    if (oldTurns > 0 && tab.hooks.some((h) => h.event === "SessionEnd")) {
+      await runHooks({
+        hooks: tab.hooks,
+        payload: {
+          event: "SessionEnd",
+          cwd: tab.rootDir,
+          turn: oldTurns,
+        },
+      }).catch(() => undefined);
+    }
     tab.currentSession = mintSessionFor(tab.rootDir);
     persistOpenTabs();
     if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+    // SessionStart is deferred to first user message (runTurn) — prevents 0-obs sessions.
+    tab.sessionStartedReported = false;
     emitSessions(tab);
   }
 
@@ -2095,6 +2111,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       mcpRuntime: null,
       mcpStatuses: new Map(),
       switching: false,
+      sessionStartedReported: false,
       hooks: loadHooks({ projectRoot: dir }),
     };
     tab.currentSession = mintSessionFor(dir);
@@ -2114,6 +2131,11 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       hasSemanticSearch: toolset.semantic.enabled,
       modelId: tab.currentModel,
     });
+
+    // SessionStart is deferred to first user message (runTurn) to prevent
+    // 0-observation sessions — agentmemory only hears about sessions with turns.
+    tab.sessionStartedReported = false;
+
     if (loadApiKey()) {
       bridgeEndpointEnv();
       tab.runtime = buildRuntimeFor(tab);
@@ -2193,6 +2215,20 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
 
   async function closeTab(tab: Tab): Promise<void> {
     abortTurn(tab);
+    // Fire SessionEnd hook before shutting down — only if the session had turns.
+    // Guard: only fire if initTabToolset completed (tab.toolset is set),
+    // and the session had at least one turn — 0-turn sessions were never reported.
+    const closeTurns = tab.runtime?.loop.stats.summary().turns ?? 0;
+    if (closeTurns > 0 && tab.toolset && tab.hooks.some((h) => h.event === "SessionEnd")) {
+      await runHooks({
+        hooks: tab.hooks,
+        payload: {
+          event: "SessionEnd",
+          cwd: tab.rootDir,
+          turn: closeTurns,
+        },
+      }).catch(() => undefined);
+    }
     try {
       await tab.toolset?.jobs.shutdown();
     } catch {
@@ -2232,6 +2268,16 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
           }
         }
       }
+    }
+    // Deferred SessionStart: only report to agentmemory on first user message.
+    // Prevents 0-observation sessions from being created at desktop startup.
+    if (!tab.sessionStartedReported && tab.hooks.some((h) => h.event === "SessionStart")) {
+      const startHooks = tab.hooks.filter((h) => h.event === "SessionStart");
+      await runHooks({
+        hooks: startHooks,
+        payload: { event: "SessionStart", cwd: tab.rootDir },
+      });
+      tab.sessionStartedReported = true;
     }
     if (tab.hooks.some((h) => h.event === "UserPromptSubmit")) {
       const report = await runHooks({
@@ -2335,6 +2381,18 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       return;
     }
     abortTurn(tab);
+    // Fire SessionEnd hook for the old workspace before switching away — only if it had turns.
+    const wsOldTurns = tab.runtime?.loop.stats.summary().turns ?? 0;
+    if (wsOldTurns > 0 && tab.hooks.some((h) => h.event === "SessionEnd")) {
+      await runHooks({
+        hooks: tab.hooks,
+        payload: {
+          event: "SessionEnd",
+          cwd: tab.rootDir,
+          turn: wsOldTurns,
+        },
+      }).catch(() => undefined);
+    }
     try {
       await tab.toolset?.jobs.shutdown();
     } catch {
@@ -2361,6 +2419,8 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       modelId: tab.currentModel,
     });
     if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+    // SessionStart is deferred to first user message (runTurn) — prevents 0-obs sessions.
+    tab.sessionStartedReported = false;
     emitSessions(tab);
     emitSettings(tab);
     emitSkills(tab);
@@ -2463,6 +2523,22 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
   async function gracefulShutdown(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Fire SessionEnd for every open tab before shutting down — only for sessions with turns.
+    await Promise.allSettled(
+      [...tabs.values()].map(async (t) => {
+        const sdTurns = t.runtime?.loop.stats.summary().turns ?? 0;
+        if (sdTurns > 0 && t.hooks.some((h) => h.event === "SessionEnd")) {
+          await runHooks({
+            hooks: t.hooks,
+            payload: {
+              event: "SessionEnd",
+              cwd: t.rootDir,
+              turn: sdTurns,
+            },
+          }).catch(() => undefined);
+        }
+      }),
+    );
     await stopDesktopQQ(false).catch(() => undefined);
     await Promise.allSettled(
       [...tabs.values()].map((t) => t.toolset?.jobs.shutdown(1500) ?? Promise.resolve()),

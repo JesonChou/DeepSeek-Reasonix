@@ -4,7 +4,7 @@ import { sessionsDir as defaultSessionsDir } from "../../memory/session.js";
 
 export interface HookRunRow {
   hookName: string;
-  phase: "PreToolUse" | "PostToolUse" | "UserPromptSubmit" | "Stop";
+  phase: "PreToolUse" | "PostToolUse" | "UserPromptSubmit" | "Stop" | "SessionEnd";
   outcome: "ok" | "blocked" | "modified" | "error";
   whenMs: number;
 }

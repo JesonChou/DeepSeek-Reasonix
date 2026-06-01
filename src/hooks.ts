@@ -7,14 +7,22 @@ import { join } from "node:path";
 import { projectHooksTrusted } from "./config.js";
 import { t } from "./i18n/index.js";
 
-export type HookEvent = "PreToolUse" | "PostToolUse" | "UserPromptSubmit" | "Stop";
+export type HookEvent =
+  | "PreToolUse"
+  | "PostToolUse"
+  | "UserPromptSubmit"
+  | "Stop"
+  | "SessionStart"
+  | "SessionEnd";
 
-/** All four events as a const array — drives slash listing + validation. */
+/** All six events as a const array — drives slash listing + validation. */
 export const HOOK_EVENTS: readonly HookEvent[] = [
   "PreToolUse",
   "PostToolUse",
   "UserPromptSubmit",
   "Stop",
+  "SessionStart",
+  "SessionEnd",
 ] as const;
 
 /** Only the gating events can block the loop. */
@@ -26,6 +34,8 @@ const DEFAULT_TIMEOUTS_MS: Record<HookEvent, number> = {
   UserPromptSubmit: 5_000,
   PostToolUse: 30_000,
   Stop: 30_000,
+  SessionStart: 10_000,
+  SessionEnd: 10_000,
 };
 
 export type HookScope = "project" | "global";
