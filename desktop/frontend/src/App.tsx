@@ -131,13 +131,14 @@ function sessionTitle(session: SessionMeta, fallback: string): string {
 }
 
 function sessionTime(ms: number): string {
-  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
+  return new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 export default function App() {
   const {
     state,
     send,
+    steer,
     notice,
     cancel,
     approve,
@@ -190,6 +191,7 @@ export default function App() {
   const footerRef = useRef<HTMLElement>(null);
   const sidebarBeforeWorkspacePreviewRef = useRef<boolean | null>(null);
   const wasRunningForWorkspaceChangesRef = useRef(false);
+  const runningRef = useRef(state.running);
   const effectiveSidebarWidth = sidebarCollapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth;
   const effectiveWorkspacePanelWidth = useMemo(
     () =>
@@ -269,6 +271,7 @@ export default function App() {
       setWorkspaceChangesRefreshKey((key) => key + 1);
     }
     wasRunningForWorkspaceChangesRef.current = state.running;
+    runningRef.current = state.running;
   }, [state.running]);
 
   // Memory drawer: opening fetches a fresh snapshot; writes re-fetch so the
@@ -321,10 +324,11 @@ export default function App() {
         notice(t("settings.themeUnknown", { name: arg }), "warn");
         return;
       }
+      if (runningRef.current) { steer(submitText.trim()); return; }
       await syncModeToController(mode);
       send(trimmed, submitText.trim());
     },
-    [switchModel, openMemory, syncModeToController, mode, send, notice, t],
+    [switchModel, openMemory, syncModeToController, mode, send, steer, notice, t],
   );
 
   const addToChat = useCallback((text: string) => {
@@ -624,6 +628,7 @@ export default function App() {
     [onRenameSession, sidebarDraft, state.running],
   );
 
+
   const confirmSidebarDelete = useCallback(
     async (path: string) => {
       if (state.running) return;
@@ -796,6 +801,7 @@ export default function App() {
                             </>
                           ) : (
                             <>
+  
                               <Tooltip label={t("history.rename")}>
                                 <button
                                   className="sidebar-session__act"

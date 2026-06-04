@@ -416,18 +416,29 @@ function reducer(s: State, a: Action): State {
     case "jobs":
       return { ...s, jobs: a.jobs };
     case "history": {
-      // Only user/assistant turns with visible text or assistant reasoning — never
-      // the system prompt or tool-result messages.
+      // User, assistant, and tool-result messages. Tool messages need
+      // toolName set by the backend before rendering as ToolCard.
       const visible = a.messages.filter(
         (m) =>
           (m.role === "user" && m.content.trim() !== "") ||
-          (m.role === "assistant" && (m.content.trim() !== "" || (m.reasoning ?? "").trim() !== "")),
+          (m.role === "assistant" && (m.content.trim() !== "" || (m.reasoning ?? "").trim() !== "")) ||
+          (m.role === "tool" && (m.toolName ?? "").trim() !== ""),
       );
-      const items: Item[] = visible.map((m, i) =>
-        m.role === "user"
-          ? { kind: "user", id: `h${i}`, text: m.content }
-          : { kind: "assistant", id: `h${i}`, text: m.content, reasoning: m.reasoning ?? "", streaming: false },
-      );
+      const items: Item[] = visible.map((m, i) => {
+        if (m.role === "user") return { kind: "user", id: `h${i}`, text: m.content };
+        if (m.role === "tool")
+          return {
+            kind: "tool",
+            id: m.toolId || `h${i}`,
+            name: m.toolName || "",
+            args: m.toolArgs || "",
+            readOnly: false,
+            status: "done" as const,
+            output: m.toolOutput,
+            truncated: m.toolTruncated,
+          };
+        return { kind: "assistant", id: `h${i}`, text: m.content, reasoning: m.reasoning ?? "", streaming: false };
+      });
       return { ...s, items, seq: s.seq + visible.length };
     }
     case "local_notice":
@@ -554,6 +565,11 @@ export function useController() {
     const submit = submitText.trim();
     const call = display !== submit ? app.SubmitDisplay(display, submit) : app.Submit(submit);
     call.catch(() => {});
+  }, []);
+
+  const steer = useCallback((text: string) => {
+    dispatch({ type: "user", text });
+    app.Steer(text).catch(() => {});
   }, []);
 
   const notice = useCallback((text: string, level: "info" | "warn" = "info") => {
@@ -751,6 +767,7 @@ export function useController() {
   return {
     state,
     send,
+    steer,
     notice,
     cancel,
     approve,

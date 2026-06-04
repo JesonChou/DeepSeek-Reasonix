@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	createNoWindow  = 0x08000000 // CREATE_NO_WINDOW
-	detachedProcess = 0x00000008 // DETACHED_PROCESS
+	createNoWindow         = 0x08000000 // CREATE_NO_WINDOW
+	detachedProcess        = 0x00000008 // DETACHED_PROCESS
+	createNewProcessGroup  = 0x00000200 // CREATE_NEW_PROCESS_GROUP
 )
 
 // HideWindow stops a child process from flashing a console window on Windows,
@@ -21,7 +22,7 @@ func HideWindow(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.HideWindow = true
-	cmd.SysProcAttr.CreationFlags |= createNoWindow
+	cmd.SysProcAttr.CreationFlags |= createNoWindow | createNewProcessGroup
 }
 
 // HideWindowDetached is for short-lived desktop-only probes whose descendants
