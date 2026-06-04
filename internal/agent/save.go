@@ -167,6 +167,13 @@ func ListSessions(dir string) ([]SessionInfo, error) {
 // user-role messages so the picker can show "5 turns · 'help me debug the…'".
 // Errors are swallowed — a malformed file just shows up with an empty preview.
 func previewSession(path string) (string, int) {
+	// Fast path: read from .meta (cached on first full scan).
+	if m, ok, _ := LoadBranchMeta(path); ok {
+		if m.Preview != "" || m.Turns > 0 {
+			return m.Preview, m.Turns
+		}
+	}
+	// Slow path: full scan and cache.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0
@@ -178,7 +185,7 @@ func previewSession(path string) (string, int) {
 	for {
 		var m provider.Message
 		if err := dec.Decode(&m); err != nil {
-			break // EOF or a malformed tail — return the preview gathered so far
+			break
 		}
 		if m.Role == provider.RoleUser {
 			turns++
@@ -190,6 +197,18 @@ func previewSession(path string) (string, int) {
 				first = s
 			}
 		}
+	}
+	// Cache the scan result in .meta for a fast next list.
+	if m, err := EnsureBranchMeta(path); err == nil {
+		m.Preview = first
+		m.Turns = turns
+		_ = SaveBranchMetaFlags(path, m)
+	}
+	// Cache the scan result in .meta for a fast next list.
+	if m, err := EnsureBranchMeta(path); err == nil {
+		m.Preview = first
+		m.Turns = turns
+		_ = SaveBranchMetaFlags(path, m)
 	}
 	return first, turns
 }

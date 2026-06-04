@@ -27,6 +27,11 @@ type BranchMeta struct {
 	WorkspaceRoot    string    `json:"workspace_root,omitempty"`
 	TopicID          string    `json:"topic_id,omitempty"`
 	TopicTitle       string    `json:"topic_title,omitempty"`
+	PlanMode         bool      `json:"plan_mode,omitempty"`
+	Bypass           bool      `json:"bypass,omitempty"`
+	Model            string    `json:"model,omitempty"`
+	Preview          string    `json:"preview,omitempty"`
+	Turns            int       `json:"turns,omitempty"`
 }
 
 func (m BranchMeta) DefaultScope() string {
@@ -90,6 +95,12 @@ func LoadBranchMeta(sessionPath string) (BranchMeta, bool, error) {
 
 func SaveBranchMeta(sessionPath string, m BranchMeta) error {
 	return saveBranchMeta(sessionPath, m, true)
+}
+
+// SaveBranchMetaFlags persists fields (plan_mode, bypass, model, preview, turns) without
+// touching UpdatedAt — a mode/model switch is not session activity.
+func SaveBranchMetaFlags(sessionPath string, m BranchMeta) error {
+	return saveBranchMeta(sessionPath, m, false)
 }
 
 func saveBranchMeta(sessionPath string, m BranchMeta, touchUpdated bool) error {

@@ -563,6 +563,7 @@ func (c *Controller) notice(text string) {
 // just needs the exit status — no TurnDone event, no cancel bookkeeping.
 func (c *Controller) Run(ctx context.Context, input string) error {
 	c.maybeSessionStart(ctx)
+	input = c.Compose(input)
 	startMessages := c.messageCount()
 	defer c.snapshotActivityIfChanged(startMessages)
 	if c.hooks.Enabled() {
@@ -676,6 +677,15 @@ func (c *Controller) SetPlanMode(v bool) {
 	if c.executor != nil {
 		c.executor.SetPlanMode(v)
 	}
+	// Persist to session meta so the mode survives a restart.
+	path := c.SessionPath()
+	if path != "" {
+		m, err := agent.EnsureBranchMeta(path)
+		if err == nil {
+			m.PlanMode = v
+			_ = agent.SaveBranchMetaFlags(path, m)
+		}
+	}
 }
 
 // PlanMode reports whether outgoing turns currently receive the plan-mode
@@ -705,6 +715,10 @@ func (c *Controller) maybeSessionStart(ctx context.Context) {
 		return
 	}
 	c.startedOnce = true
+	// Lazy-init the session path on first turn.
+	if c.sessionPath == "" && c.sessionDir != "" {
+		c.sessionPath = agent.NewSessionPath(c.sessionDir, c.label)
+	}
 	c.mu.Unlock()
 	c.hooks.SessionStart(ctx)
 }
@@ -719,7 +733,13 @@ func (c *Controller) NewSession() error {
 	if err := c.Snapshot(); err != nil {
 		return err
 	}
-	c.hooks.SessionEnd(context.Background())
+	// SessionEnd only fires when the old session had at least one turn.
+	c.mu.Lock()
+	hadTurns := c.turn > 0
+	c.mu.Unlock()
+	if hadTurns {
+		c.hooks.SessionEnd(context.Background())
+	}
 	if c.sessionDir != "" {
 		c.mu.Lock()
 		c.sessionPath = agent.NewSessionPath(c.sessionDir, c.label)
@@ -728,9 +748,9 @@ func (c *Controller) NewSession() error {
 	c.executor.SetSession(agent.NewSession(c.systemPrompt))
 	c.rebindCheckpoints(c.SessionPath())
 	c.mu.Lock()
-	c.startedOnce = true // NewSession fires SessionStart itself; don't re-fire on the next turn
+	c.turn = 0
+	c.startedOnce = false // SessionStart fires lazily on the first turn, not here
 	c.mu.Unlock()
-	c.hooks.SessionStart(context.Background())
 	return nil
 }
 
@@ -1061,8 +1081,32 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	}
 	c.mu.Lock()
 	c.sessionPath = path
+	c.startedOnce = false // allow SessionStart on the resumed session's first turn
 	c.mu.Unlock()
 	c.rebindCheckpoints(path)
+	// Restore the saved mode from the session meta.
+	if m, ok, err := agent.LoadBranchMeta(path); err == nil && ok {
+		if m.PlanMode {
+			c.mu.Lock()
+			c.planMode = true
+			c.mu.Unlock()
+			if c.executor != nil {
+				c.executor.SetPlanMode(true)
+			}
+		} else if m.Bypass {
+			c.mu.Lock()
+			c.bypass = true
+			c.mu.Unlock()
+		}
+	} else {
+		c.mu.Lock()
+		c.planMode = false
+		c.bypass = false
+		c.mu.Unlock()
+		if c.executor != nil {
+			c.executor.SetPlanMode(false)
+		}
+	}
 }
 
 // Snapshot writes the executor's conversation to the active session file. No-op
@@ -1538,6 +1582,27 @@ func (c *Controller) Bypass() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.bypass
+}
+
+// Steer queues guidance mid-turn without interrupting the in-flight request.
+func (c *Controller) Steer(text string) {
+	c.mu.Lock()
+	exec := c.executor
+	c.mu.Unlock()
+	if exec != nil {
+		exec.Steer(text)
+	}
+}
+
+// SteerConsumed returns true when the steer queue is empty after the last consume.
+func (c *Controller) SteerConsumed() bool {
+	c.mu.Lock()
+	exec := c.executor
+	c.mu.Unlock()
+	if exec != nil {
+		return exec.SteerConsumed()
+	}
+	return true
 }
 
 // --- memory ---
