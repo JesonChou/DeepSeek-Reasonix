@@ -71,6 +71,9 @@ type chatTUI struct {
 	// the provider re-attempts the connection; cleared by the next stream event.
 	retryAttempt int
 	retryMax     int
+	// steerStaged counts queued mid-turn steers not yet consumed.
+	steerStaged int
+
 	// turnTokens accumulates this turn's output tokens (summed from per-step Usage
 	// events) for the live "↓N" readout in the running status line.
 	turnTokens int
@@ -504,6 +507,31 @@ func (m *chatTUI) prompts() []plugin.Prompt {
 	return m.host.Prompts()
 }
 
+func (m *chatTUI) mcpTools() []plugin.ToolRef {
+	if m.host == nil {
+		return nil
+	}
+	return m.host.Tools()
+}
+
+func (m *chatTUI) isMCPPromptName(name string) bool {
+	for _, p := range m.prompts() {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *chatTUI) isMCPToolName(name string) bool {
+	for _, t := range m.mcpTools() {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (m chatTUI) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
@@ -512,6 +540,11 @@ func (m chatTUI) Init() tea.Cmd {
 		m.runStatusline(), // nil (no-op) unless a custom status line is configured
 		m.refreshGitStatus(),
 	)
+}
+
+func isSteerCommand(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "#	") || strings.HasPrefix(trimmed, "!")
 }
 
 func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -868,14 +901,14 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.state == tuiRunning {
 				line := strings.TrimSpace(m.input.Value())
-				if line == "" {
+				if line == "" || isSteerCommand(line) {
 					return m, nil
 				}
-				m.pendingInterject = append(m.pendingInterject, line)
+				m.ctrl.Steer(line)
+				m.steerStaged++
 				m.input.Reset()
 				m.input.SetHeight(1)
 				m.pastedBlocks = nil
-				m.notice("feedback queued — will send when the current turn finishes")
 				return m, finalize(m, cmds)
 			}
 			if m.modelSwitchPending {
@@ -1752,12 +1785,21 @@ func (m chatTUI) View() tea.View {
 		parts = append(parts, menu)
 		rowsAboveBox += strings.Count(menu, "\n") + 1
 	}
+	// Steer staged indicator.
+	var steerIndicator string
+	if m.steerStaged > 0 {
+		steerIndicator = fmt.Sprintf("  ▸ %d staged · esc to stop", m.steerStaged)
+	}
 	// Layout: the working spinner (when running), then the composer when visible,
 	// then the two status rows (line 1 = mode + shortcuts/state, line 2 = live data).
 	// Each row is clamped to width independently so neither wraps; padding to full
 	// width keeps a short row from leaving stale cells from the prior frame.
 	if working != "" {
 		parts = append(parts, workingStyle.Width(boxW).MaxWidth(boxW).Render(clampStatusLine(working, boxW)))
+		rowsAboveBox++
+	}
+	if steerIndicator != "" {
+		parts = append(parts, lipgloss.NewStyle().Width(boxW).MaxWidth(boxW).Render(clampStatusLine(steerIndicator, boxW)))
 		rowsAboveBox++
 	}
 	if footer := m.renderMainManagerFooter(); footer != "" {
@@ -2398,6 +2440,7 @@ func (m *chatTUI) startTurnWithRaw(sent, displayed, restore, raw string) tea.Cmd
 	m.runStart = time.Now()
 	m.elapsed = 0
 	m.turnTokens = 0
+	m.steerStaged = 0
 	// The controller owns the run goroutine, its context, and cancellation; it
 	// streams events to eventCh and emits TurnDone when the turn settles.
 	m.ctrl.SendWithRaw(sent, raw)
@@ -2584,6 +2627,13 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 			m.host = m.ctrl.Host()
 		}
 		m.refreshMCPManager()
+
+	case event.Steer:
+		if m.steerStaged > 0 {
+			m.steerStaged--
+		}
+		m.finalizeStreamed()
+		m.commitLine(dim("  ▸ steer: " + e.Text))
 
 	case event.TurnDone:
 		// The turn settled — freeze anything still streaming, surface a real error,

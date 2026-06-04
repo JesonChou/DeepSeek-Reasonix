@@ -81,6 +81,28 @@ type Host struct {
 	bgWrites sync.WaitGroup
 }
 
+
+// ToolRef is an MCP tool surface for the slash menu, carrying name,
+// server, and a one-line description.
+type ToolRef struct {
+	Name        string
+	Server      string
+	Description string
+}
+
+// Tools returns the discovered MCP tools across all connected servers.
+func (h *Host) Tools() []ToolRef {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var out []ToolRef
+	for _, cl := range h.clients {
+		for _, t := range cl.tools {
+			out = append(out, ToolRef{Name: t.Name, Server: cl.name, Description: t.Description})
+		}
+	}
+	return out
+}
+
 // Prompts returns every MCP prompt discovered across connected servers.
 func (h *Host) Prompts() []Prompt {
 	h.mu.RLock()

@@ -139,6 +139,7 @@ export interface AppBindings {
   // SetBypass toggles YOLO mode (auto-approve every tool call this session; deny
   // rules still apply). Runtime-only — not written to config.
   SetBypass(on: boolean): Promise<void>;
+  Steer(text: string): Promise<void>;
   // Auto-updater (desktop/updater_app.go): the injected build version, a manifest
   // check, applying an update (win/linux self-update; macOS opens the download
   // page), and opening that page directly. Progress streams on "updater:progress".
@@ -940,6 +941,7 @@ function makeMockApp(): AppBindings {
     async SetBypass(on: boolean) {
       settings.bypass = on;
     },
+    async Steer(_text: string) {},
     async Version() {
       return "v1.0.0 (browser dev)";
     },

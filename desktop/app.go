@@ -62,6 +62,12 @@ type App struct {
 	disabledMCP map[string]ServerView
 	mcpOrder    []string
 
+	// listCache holds the last ListSessions result for a brief TTL so
+	// rapid re-fetches avoid repeated disk scans.
+	listMu    sync.Mutex
+	listTTL   time.Time
+	listCache []SessionMeta
+
 	// Per-turn autosave runs off the event goroutine so disk I/O never delays
 	// event delivery; overlapping requests coalesce into one trailing write.
 	saveMu    sync.Mutex
@@ -152,10 +158,8 @@ func (a *App) buildController() {
 	// approval_request events, answered via Approve.
 	ctrl.EnableInteractiveApproval()
 
-	// Land auto-save in a fresh session file (same as a fresh chat/serve start).
-	if dir := ctrl.SessionDir(); dir != "" {
-		ctrl.SetSessionPath(agent.NewSessionPath(dir, ctrl.Label()))
-	}
+	// Session file is created lazily on the first user turn (maybeSessionStart)
+	// so a boot that lands on a resume never creates a throwaway empty file.
 
 	// Notify the frontend that the controller is ready — it re-fetches Meta,
 	// ContextUsage, and History.
@@ -403,6 +407,15 @@ type WorkspaceMeta struct {
 // marking the one the current conversation is writing to and attaching any
 // user-chosen titles.
 func (a *App) ListSessions() []SessionMeta {
+	// Return cached result within 500ms of the last call.
+	a.listMu.Lock()
+	if time.Since(a.listTTL) < 500*time.Millisecond && a.listCache != nil {
+		cached := a.listCache
+		a.listMu.Unlock()
+		return cached
+	}
+	a.listMu.Unlock()
+
 	dir := config.SessionDir()
 	infos, err := agent.ListSessions(dir)
 	if err != nil {
@@ -429,7 +442,48 @@ func (a *App) ListSessions() []SessionMeta {
 			Current:        s.Path == cur,
 		})
 	}
-	return out
+	// Deduplicate: sessions with the same display text (title || preview)
+	seen := map[string]*SessionMeta{}
+	for i := range out {
+		key := sessionDedupKey(out[i], titles)
+		if key == "" {
+			continue
+		}
+		prev, exists := seen[key]
+		if !exists || out[i].LastActivityAt > prev.LastActivityAt {
+			if exists {
+				go removeSessionArtifacts(dir, prev.Path, filepath.Base(prev.Path))
+			}
+			seen[key] = &out[i]
+		}
+	}
+	deduped := make([]SessionMeta, 0, len(seen))
+	for i := range out {
+		s := out[i]
+		if keep, ok := seen[sessionDedupKey(s, titles)]; ok && keep.Path == s.Path {
+			deduped = append(deduped, s)
+		}
+	}
+	// Sort: current session at top, rest by recency.
+	sort.SliceStable(deduped, func(i, j int) bool {
+		if deduped[i].Current != deduped[j].Current {
+			return deduped[i].Current
+		}
+		return deduped[i].LastActivityAt > deduped[j].LastActivityAt
+	})
+	a.listMu.Lock()
+	a.listCache = deduped
+	a.listTTL = time.Now()
+	a.listMu.Unlock()
+	return deduped
+}
+
+// sessionDedupKey derives a merge key from a session's display text.
+func sessionDedupKey(s SessionMeta, _ map[string]string) string {
+	if strings.TrimSpace(s.Title) != "" {
+		return s.Title
+	}
+	return s.Preview
 }
 
 // DeleteSession removes a saved session (and its title). It refuses the active
@@ -474,9 +528,59 @@ func (a *App) ResumeSession(path string) ([]HistoryMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = ctrl.Snapshot() // persist the current session before switching away
+	_ = ctrl.Snapshot()
+
+	// Check whether the saved session was last used with a different model.
+	savedModel := ""
+	if m, ok, _ := agent.LoadBranchMeta(path); ok {
+		savedModel = m.Model
+	}
+
+	// Always resume on the current controller immediately — instant UI.
 	ctrl.Resume(loaded, path)
+	a.listMu.Lock()
+	a.listCache = nil
+	a.listMu.Unlock()
+
+	// If the model differs, rebuild with the saved model in the background
+	// so the UI never blocks and the correct model loads without the user
+	// having to switch manually.
+	if savedModel != "" && savedModel != a.model {
+		go a.asyncSwitchAndResume(savedModel, path)
+	}
+
 	return a.History(), nil
+}
+
+// asyncSwitchAndResume rebuilds the controller for the saved model, resumes
+// the session on the new controller, restores plan/bypass modes from meta,
+// and notifies the frontend. Runs in a goroutine so ResumeSession returns
+// instantly — model rebuild and MCP startup happen in the background.
+func (a *App) asyncSwitchAndResume(ref, path string) {
+	a.switchToModel(ref)
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		slog.Warn("desktop: asyncSwitchAndResume LoadSession", "path", path, "err", err)
+		return
+	}
+	a.mu.RLock()
+	nc := a.ctrl
+	a.mu.RUnlock()
+	if nc != nil {
+		nc.Resume(loaded, path)
+		if m, ok, err := agent.LoadBranchMeta(path); err == nil && ok {
+			if m.PlanMode {
+				nc.SetPlanMode(true)
+			}
+			if m.Bypass {
+				nc.SetBypass(true)
+			}
+		}
+	}
+	a.listMu.Lock()
+	a.listCache = nil
+	a.listMu.Unlock()
+	runtime.EventsEmit(a.ctx, "agent:ready")
 }
 
 // PreviewSession reads a saved session for display only. It does not snapshot or
@@ -614,7 +718,12 @@ func (a *App) SwitchWorkspace(dir string) (string, error) {
 type HistoryMessage struct {
 	Role      string `json:"role"`
 	Content   string `json:"content"`
-	Reasoning string `json:"reasoning,omitempty"`
+	Reasoning     string `json:"reasoning,omitempty"`
+	ToolName      string `json:"toolName,omitempty"`
+	ToolArgs      string `json:"toolArgs,omitempty"`
+	ToolOutput    string `json:"toolOutput,omitempty"`
+	ToolID        string `json:"toolId,omitempty"`
+	ToolTruncated bool   `json:"toolTruncated,omitempty"`
 }
 
 // History returns the session's message log.
@@ -630,6 +739,17 @@ func (a *App) History() []HistoryMessage {
 }
 
 func historyMessages(msgs []provider.Message, resolveUserContent func(string) string) []HistoryMessage {
+	toolCallByID := make(map[string]provider.ToolCall, 4)
+	for _, m := range msgs {
+		if m.Role == provider.RoleAssistant {
+			for _, tc := range m.ToolCalls {
+				if tc.ID != "" {
+					toolCallByID[tc.ID] = tc
+				}
+			}
+		}
+	}
+
 	out := make([]HistoryMessage, 0, len(msgs))
 	for _, m := range msgs {
 		content := m.Content
@@ -640,7 +760,20 @@ func historyMessages(msgs []provider.Message, resolveUserContent func(string) st
 		if m.Role == provider.RoleAssistant {
 			reasoning = m.ReasoningContent
 		}
-		out = append(out, HistoryMessage{Role: string(m.Role), Content: content, Reasoning: reasoning})
+		hm := HistoryMessage{Role: string(m.Role), Content: content, Reasoning: reasoning}
+		if m.Role == provider.RoleTool {
+			hm.ToolName = m.Name
+			hm.ToolOutput = m.Content
+			hm.ToolID = m.ToolCallID
+			hm.Content = ""
+			if tc, ok := toolCallByID[m.ToolCallID]; ok {
+				hm.ToolArgs = tc.Arguments
+				if hm.ToolName == "" {
+					hm.ToolName = tc.Name
+				}
+			}
+		}
+		out = append(out, hm)
 	}
 	return out
 }
@@ -735,6 +868,7 @@ type Meta struct {
 	StartupErr   string `json:"startupErr,omitempty"`
 	EventChannel string `json:"eventChannel"`
 	Cwd          string `json:"cwd"`
+	Plan         bool   `json:"plan"`   // plan (read-only) mode on
 	Bypass       bool   `json:"bypass"` // YOLO mode on (auto-approve every tool call)
 }
 
@@ -755,8 +889,28 @@ func (a *App) Meta() Meta {
 		StartupErr:   startupErr,
 		EventChannel: eventChannel,
 		Cwd:          cwd,
+		Plan:         ctrl != nil && ctrl.PlanMode(),
 		Bypass:       ctrl != nil && ctrl.Bypass(),
 	}
+}
+
+// switchToModel closes the current controller and builds a new one for the
+// given model ref, keeping the same sink.
+func (a *App) switchToModel(ref string) {
+	if a.ctrl != nil {
+		a.ctrl.Close()
+	}
+	ctrl, err := boot.Build(a.ctx, boot.Options{Model: ref, RequireKey: false, Sink: a.sink})
+	if err != nil {
+		slog.Warn("desktop: switchToModel failed", "model", ref, "err", err)
+		return
+	}
+	ctrl.EnableInteractiveApproval()
+	a.mu.Lock()
+	a.ctrl = ctrl
+	a.model = ref
+	a.label = ctrl.Label()
+	a.mu.Unlock()
 }
 
 // SetBypass toggles YOLO mode for the session: auto-approve every tool call
@@ -768,6 +922,16 @@ func (a *App) SetBypass(on bool) {
 	a.mu.RUnlock()
 	if ctrl != nil {
 		ctrl.SetBypass(on)
+	}
+}
+
+// Steer sends mid-turn guidance to the agent without interrupting the in-flight request.
+func (a *App) Steer(text string) {
+	a.mu.RLock()
+	ctrl := a.ctrl
+	a.mu.RUnlock()
+	if ctrl != nil {
+		ctrl.Steer(text)
 	}
 }
 
@@ -1797,6 +1961,14 @@ func (a *App) SetModel(name string) error {
 		newCtrl.Resume(&agent.Session{Messages: carried}, path)
 	} else if path != "" {
 		newCtrl.SetSessionPath(path)
+	}
+	// Persist the model choice to session meta.
+	if path != "" {
+		m, err := agent.EnsureBranchMeta(path)
+		if err == nil {
+			m.Model = name
+			_ = agent.SaveBranchMetaFlags(path, m)
+		}
 	}
 	return nil
 }
