@@ -368,6 +368,8 @@ function applyEvent(s: State, e: WireEvent): State {
       const items = at < 0 ? [...s.items, filled] : s.items.map((it, i) => (i === at ? filled : it));
       return { ...s, running: s.turnActive ? s.running : false, seq: s.seq + 1, items };
     }
+    case "steer":
+      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `s${s.seq}`, level: "info", text: `↪ ${e.text ?? ""}` }] };
     case "approval_request": return { ...s, approval: e.approval };
     case "ask_request": return { ...s, ask: e.ask };
     case "turn_done": {
@@ -660,6 +662,14 @@ export function useController() {
     app.RunShellForTab(activeTabId, command).catch(() => {});
   }, [activeTabId, dispatchTo]);
 
+  const steer = useCallback((text: string) => {
+    if (!activeTabId) return;
+    // Steer is queued to the agent and persisted to session for history
+    dispatchTo(activeTabId, { type: "user", text, seq: getOrCreateState(statesRef.current, activeTabId).seq });
+    // Steer event drives a compact guidance notice in the transcript,
+    app.SteerForTab(activeTabId, text).catch(() => {});
+  }, [activeTabId, dispatchTo]);
+
   const notice = useCallback((text: string, level: "info" | "warn" = "info") => {
     if (!activeTabId) return;
     dispatchTo(activeTabId, { type: "local_notice", level, text });
@@ -900,7 +910,7 @@ export function useController() {
   return {
     state: activeState,
     activeTabId,
-    send, runShell, notice, cancel, approve, answerQuestion, setControllerMode, setCollaborationMode, setToolApprovalMode, setGoal, clearGoal,
+    send, runShell, steer, notice, cancel, approve, answerQuestion, setControllerMode, setCollaborationMode, setToolApprovalMode, setGoal, clearGoal,
     newSession, clearSession, listSessions, listTrashedSessions, resumeSession, previewSession, deleteSession, restoreSession, purgeTrashedSession, renameSession,
     refreshMeta, pickWorkspace, switchWorkspace, compact, rewind, setModel, setEffort,
     fetchMemory, remember, forget, saveDoc,
