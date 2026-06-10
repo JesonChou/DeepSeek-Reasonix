@@ -204,6 +204,31 @@ func TestRememberRuleWithFileSubjectIsToolWide(t *testing.T) {
 	}
 }
 
+// TestPersistedEditRuleIsToolWide asserts a deliberate design choice: when a
+// user persists an "always allow" for a file-mutation tool, the saved rule is
+// "Edit" — tool-wide, with no path restriction.  This means approving one
+// edit_file call and choosing "Always allow (save to config)" grants blanket
+// edit permission for every file, across sessions, for every file-mutation
+// tool (write_file, multi_edit, etc.).  Deny rules still take precedence.
+func TestPersistedEditRuleIsToolWide(t *testing.T) {
+	rule := RememberRuleForScope("edit_file", "src/app.go")
+	if rule != "Edit" {
+		t.Fatalf("persisted rule = %q, want tool-wide Edit (no path restriction)", rule)
+	}
+	// The tool-wide Edit rule matches any file-mutation tool on any file.
+	allMutationTools := []string{"write_file", "edit_file", "multi_edit", "notebook_edit", "delete_range", "delete_symbol"}
+	for _, tm := range allMutationTools {
+		if !RuleMatchesString(rule, tm, "any/path/at/all.txt") {
+			t.Errorf("tool-wide Edit should match %s on any path", tm)
+		}
+	}
+	// It must NOT match non-mutation tools (otherwise a denylist would be
+	// needed for every tool, which isn't the intent).
+	if RuleMatchesString(rule, "bash", "rm -rf /") {
+		t.Errorf("tool-wide Edit must not match bash")
+	}
+}
+
 func TestRememberRuleWithoutSubject(t *testing.T) {
 	got := rememberRule("ls", "")
 	if got != "ls" {

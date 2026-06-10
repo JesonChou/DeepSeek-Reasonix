@@ -170,7 +170,6 @@ type approvalReply struct {
 	allow   bool
 	session bool
 	persist bool // true = write "always allow" rule to config
-	scope   string
 }
 
 type pendingApproval struct {
@@ -1047,18 +1046,12 @@ func (c *Controller) Turn() int {
 // also remembers a grant for the rest of the session so the same approval scope
 // is not re-prompted. Unknown/expired IDs are ignored.
 func (c *Controller) Approve(id string, allow, session, persist bool) {
-	c.ApproveWithScope(id, allow, session, persist, permission.ApprovalScopeExact)
-}
-
-// ApproveWithScope answers a pending ApprovalRequest with an explicit approval
-// scope. Unknown/expired IDs are ignored.
-func (c *Controller) ApproveWithScope(id string, allow, session, persist bool, scope string) {
 	c.mu.Lock()
 	pending := c.approvals[id]
 	delete(c.approvals, id)
 	c.mu.Unlock()
 	if pending.reply != nil {
-		pending.reply <- approvalReply{allow: allow, session: session, persist: persist, scope: scope} // buffered, never blocks
+		pending.reply <- approvalReply{allow: allow, session: session, persist: persist} // buffered, never blocks
 	}
 }
 

@@ -62,14 +62,6 @@ type Rule struct {
 	Literal bool
 }
 
-const (
-	// ApprovalScopeExact grants only the concrete tool subject being approved.
-	ApprovalScopeExact = "exact"
-	// ApprovalScopePrefix grants a conservative command prefix for bash
-	// approvals, such as "go test:*". Non-bash tools fall back to exact scope.
-	ApprovalScopePrefix = "prefix"
-)
-
 // ParseRule parses "ToolName", "ToolName(glob)", or the legacy
 // "ToolName=literal" form. Surrounding whitespace is trimmed. The "=literal"
 // form (taken when the '=' precedes any '(') matches the rest of the string
