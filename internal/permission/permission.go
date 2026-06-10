@@ -361,49 +361,49 @@ func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage,
 }
 
 // rememberRule builds the rule string persisted when the user picks "always
-// allow". Bash commands and file paths stay subject-scoped; other tools are
-// remembered by tool name. Deny and ask rules keep their higher precedence.
+// allow". Bash commands prefer a safe command prefix (e.g. go test:*) so
+// "always allow" covers similar invocations with different arguments. File
+// mutation tools are remembered tool-wide ("Edit") so approving one file edit
+// covers all files. Other tools are remembered by tool name. Deny and ask rules keep their higher precedence.
 func rememberRule(toolName, subject string) string {
-	return RememberRuleForScope(toolName, subject, ApprovalScopeExact)
+	return RememberRuleForScope(toolName, subject)
 }
 
 // RememberRuleForScope builds the rule string persisted when the user chooses
-// an always-allow option for a given approval scope.
-func RememberRuleForScope(toolName, subject, scope string) string {
+// an always-allow option. Bash commands prefer a safe prefix (go test:*) so
+// similar invocations (different search terms, different test packages) match;
+// when no safe prefix can be extracted the exact command is used. File
+// mutation tools are always remembered tool-wide (Edit). Other tools use their
+// bare tool name. Deny rules still take precedence on every call.
+func RememberRuleForScope(toolName, subject string) string {
 	subject = strings.TrimSpace(subject)
 	if subject != "" && toolName == "bash" {
-		if scope == ApprovalScopePrefix {
-			if pattern := BashCommandPrefix(subject); pattern != "" {
-				return "Bash(" + pattern + ")"
-			}
+		if pattern := BashCommandPrefix(subject); pattern != "" {
+			return "Bash(" + pattern + ")"
 		}
 		return "Bash(" + subject + ")"
 	}
 	if IsFileMutationTool(toolName) {
-		if subject != "" {
-			return "Edit(" + subject + ")"
-		}
 		return "Edit"
 	}
 	return toolName
 }
 
 // SessionGrantKey returns the in-memory rule for "allow this session". Bash
-// follows Claude Code's command-scoped behavior by default; file mutation tools
-// share a session grant so edit-heavy turns do not pause on every file operation.
+// prefers a command prefix when one is available, falling back to the exact
+// command when unsafe. File mutation tools share a single Edit grant.
 func SessionGrantKey(toolName, subject string) string {
-	return SessionGrantRuleForScope(toolName, subject, ApprovalScopeExact)
+	return SessionGrantRuleForScope(toolName, subject)
 }
 
-// SessionGrantRuleForScope returns the in-memory rule for a scoped session
-// grant. Prefix grants are intentionally bash-only.
-func SessionGrantRuleForScope(toolName, subject, scope string) string {
+// SessionGrantRuleForScope returns the in-memory rule for a session grant.
+// Bash prefers a command prefix when one is available; file mutation tools
+// share a single Edit grant; all other tools return the bare tool name.
+func SessionGrantRuleForScope(toolName, subject string) string {
 	subject = strings.TrimSpace(subject)
 	if toolName == "bash" && subject != "" {
-		if scope == ApprovalScopePrefix {
-			if pattern := BashCommandPrefix(subject); pattern != "" {
-				return "Bash(" + pattern + ")"
-			}
+		if pattern := BashCommandPrefix(subject); pattern != "" {
+			return "Bash(" + pattern + ")"
 		}
 		return "Bash(" + subject + ")"
 	}

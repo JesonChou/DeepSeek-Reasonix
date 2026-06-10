@@ -259,8 +259,8 @@ func (s *updateSink) requestPermission(ctx context.Context, a event.Approval) {
 }
 
 func approvalOptionNames(tool, subject string) (session, persistent string) {
-	sessionRule := permission.SessionGrantRuleForScope(tool, subject, permission.ApprovalScopeExact)
-	persistentRule := permission.RememberRuleForScope(tool, subject, permission.ApprovalScopeExact)
+	sessionRule := permission.SessionGrantRuleForScope(tool, subject)
+	persistentRule := permission.RememberRuleForScope(tool, subject)
 	switch {
 	case tool == "bash" && strings.TrimSpace(subject) != "":
 		return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
@@ -280,7 +280,7 @@ func approvalOptions(tool, subject string) []PermissionOption {
 		{OptionID: string(OptAllowOnce), Name: "Allow", Kind: OptAllowOnce},
 	}
 	if tool == "bash" && permission.BashCommandPrefix(subject) != "" {
-		prefixRule := permission.RememberRuleForScope(tool, subject, permission.ApprovalScopePrefix)
+		prefixRule := permission.RememberRuleForScope(tool, subject)
 		options = append(options,
 			PermissionOption{OptionID: string(OptAllowPrefix), Name: "Allow " + prefixRule + " for this session", Kind: OptAllowAlways},
 			PermissionOption{OptionID: string(OptPersistPrefix), Name: "Always allow " + prefixRule + " (save to config)", Kind: OptAllowPersistent},

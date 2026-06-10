@@ -2435,11 +2435,11 @@ func (m chatTUI) renderApprovalBanner() string {
 	if subj != "" {
 		subj = " " + truncateSubject(subj, w)
 	}
-	exactSessionRule := permission.SessionGrantRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject, permission.ApprovalScopeExact)
-	exactPersistentRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject, permission.ApprovalScopeExact)
+	exactSessionRule := permission.SessionGrantRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
+	exactPersistentRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
 	choices := fmt.Sprintf(i18n.M.ToolApprovalChoices, exactSessionRule, exactPersistentRule)
 	if m.pendingApproval.Tool == "bash" && permission.BashCommandPrefix(m.pendingApproval.Subject) != "" {
-		prefixRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject, permission.ApprovalScopePrefix)
+		prefixRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
 		choices = fmt.Sprintf(i18n.M.BashPrefixChoices, prefixRule, prefixRule)
 	}
 	text := fmt.Sprintf(i18n.M.ToolApprovalPromptFmt, name, subj, detail, choices)

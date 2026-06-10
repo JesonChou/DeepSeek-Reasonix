@@ -142,18 +142,30 @@ func TestSubjectPriority(t *testing.T) {
 
 // --- rememberRule ---
 
-func TestRememberRuleWithBashSubjectUsesCommandScope(t *testing.T) {
+func TestRememberRuleWithBashSubjectUsesPrefixWhenAvailable(t *testing.T) {
+	// Bash commands with a safe prefix prefer the prefix over the exact command
+	// so "always allow" covers similar invocations (e.g. different search terms).
 	got := rememberRule("bash", "go test ./...")
-	if got != "Bash(go test ./...)" {
-		t.Errorf("rememberRule = %q", got)
+	if got != "Bash(go test:*)" {
+		t.Errorf("rememberRule = %q, want Bash(go test:*)", got)
 	}
-	if r, ok := ParseRule(got); !ok || r.Literal || r.Tool != "Bash" || r.Subject != "go test ./..." {
+	if r, ok := ParseRule(got); !ok || r.Literal || r.Tool != "Bash" || r.Subject != "go test:*" {
 		t.Errorf("ParseRule(%q) = {%q,%q,lit=%v,ok=%v}", got, r.Tool, r.Subject, r.Literal, ok)
+	}
+	// Verify the prefix rule matches similar commands.
+	if !RuleMatchesString(got, "bash", "go test ./...") {
+		t.Errorf("prefix rule should match the exact command")
+	}
+	if !RuleMatchesString(got, "bash", "go test ./internal/control") {
+		t.Errorf("prefix rule should match similar go test command")
+	}
+	if RuleMatchesString(got, "bash", "go build ./...") {
+		t.Errorf("prefix rule should not match different go subcommand")
 	}
 }
 
-func TestRememberRuleForBashPrefixUsesGlobScope(t *testing.T) {
-	got := RememberRuleForScope("bash", "go test ./...", ApprovalScopePrefix)
+func TestRememberRuleForBashUsesPrefixWhenAvailable(t *testing.T) {
+	got := RememberRuleForScope("bash", "go test ./...")
 	if got != "Bash(go test:*)" {
 		t.Errorf("RememberRuleForScope prefix = %q", got)
 	}
@@ -180,12 +192,14 @@ func TestRememberRuleForBashPrefixUsesGlobScope(t *testing.T) {
 	}
 }
 
-func TestRememberRuleWithFileSubjectUsesPathScope(t *testing.T) {
+func TestRememberRuleWithFileSubjectIsToolWide(t *testing.T) {
+	// File mutation tools are remembered tool-wide so "always allow editing"
+	// covers any file, matching the session-grant behaviour.
 	got := rememberRule("edit_file", "src/app.go")
-	if got != "Edit(src/app.go)" {
-		t.Errorf("rememberRule = %q", got)
+	if got != "Edit" {
+		t.Errorf("rememberRule = %q, want Edit", got)
 	}
-	if r, ok := ParseRule(got); !ok || r.Literal || r.Tool != "Edit" || r.Subject != "src/app.go" {
+	if r, ok := ParseRule(got); !ok || r.Literal || r.Tool != "Edit" || r.Subject != "" {
 		t.Errorf("ParseRule(%q) = {%q,%q,lit=%v,ok=%v}", got, r.Tool, r.Subject, r.Literal, ok)
 	}
 }
@@ -213,8 +227,8 @@ func TestSessionGrantKeyGroupsFileMutationTools(t *testing.T) {
 	}
 }
 
-func TestSessionGrantRuleForBashPrefix(t *testing.T) {
-	got := SessionGrantRuleForScope("bash", "npm run test -- --watch", ApprovalScopePrefix)
+func TestSessionGrantRuleForBashUsesPrefix(t *testing.T) {
+	got := SessionGrantRuleForScope("bash", "npm run test -- --watch")
 	if got != "Bash(npm run test:*)" {
 		t.Errorf("SessionGrantRuleForScope prefix = %q", got)
 	}

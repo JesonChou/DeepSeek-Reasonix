@@ -2631,13 +2631,13 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 		// Plan approvals are one-shot — never persist a session grant for them, or
 		// every future plan would auto-approve.
 		if r.allow && r.session && tool != planApprovalTool {
-			rule := permission.SessionGrantRuleForScope(tool, subject, r.scope)
+			rule := permission.SessionGrantRuleForScope(tool, subject)
 			c.mu.Lock()
 			c.granted[rule] = true
 			c.mu.Unlock()
 		}
 		if r.allow && r.persist && tool != planApprovalTool && c.onRemember != nil {
-			c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject, r.scope)))
+			c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject)))
 		}
 		return r.allow, false, nil
 	case <-ctx.Done():
