@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"reasonix/internal/agent"
+
 	"reasonix/internal/command"
 	"reasonix/internal/event"
 	"reasonix/internal/memory"
@@ -642,7 +644,7 @@ func TestIsSyntheticUserMessage(t *testing.T) {
 		},
 		{
 			name:  "mid-turn steer is not synthetic (handled separately in historyMessages)",
-			input: "[Mid-turn steer queued by the user. Do not treat this as a new task; use it only as additional guidance for the current task after completing the current step.]\nplease use smaller diffs",
+			input: agent.MidTurnSteerPrefix + "\nplease use smaller diffs",
 			want:  false,
 		},
 	}
