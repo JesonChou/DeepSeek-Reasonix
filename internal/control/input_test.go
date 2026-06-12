@@ -641,9 +641,9 @@ func TestIsSyntheticUserMessage(t *testing.T) {
 			want:  false,
 		},
 		{
-			name:  "mid-turn steer wrapper",
+			name:  "mid-turn steer is not synthetic (handled separately in historyMessages)",
 			input: "[Mid-turn steer queued by the user. Do not treat this as a new task; use it only as additional guidance for the current task after completing the current step.]\nplease use smaller diffs",
-			want:  true,
+			want:  false,
 		},
 	}
 	for _, tt := range tests {
