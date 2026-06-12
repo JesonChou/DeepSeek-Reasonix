@@ -325,6 +325,34 @@ export interface SessionReference {
   lastActivityAt?: number;
 }
 
+// Attachment represents a file attached to the composer input.
+export interface Attachment {
+  path: string;
+  previewUrl?: string;
+  displayName?: string;
+}
+
+// WorkspaceReference represents a workspace file/directory @-mentioned in the composer.
+export interface WorkspaceReference {
+  path: string;
+  isDir?: boolean;
+}
+
+// PastedBlock is a collapsed long-paste block in the composer.
+export interface PastedBlock {
+  label: string;
+  text: string;
+}
+
+// ComposerDraft captures all per-tab composer state that should survive tab switches.
+export interface ComposerDraft {
+  text: string;
+  attachments: Attachment[];
+  workspaceRefs: WorkspaceReference[];
+  pastedBlocks: PastedBlock[];
+  sessionRefs: SessionReference[];
+}
+
 export interface WorkspaceView {
   path: string;
   name: string;

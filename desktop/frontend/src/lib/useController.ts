@@ -16,6 +16,7 @@ import type {
   BalanceInfo,
   CheckpointMeta,
   CollaborationMode,
+  ComposerDraft,
   ContextInfo,
   EffortInfo,
   HistoryMessage,
@@ -39,6 +40,8 @@ export type ToolStatus = "running" | "done" | "error" | "stopped";
 export type LiveStream = { id: string; text: string; reasoning: string; reasoningComplete: boolean };
 export type MessageActionScope = "fork" | "summ-from" | "summ-upto" | "conversation" | "code" | "both";
 export type MessageActionState = { turn: number; scope: MessageActionScope };
+
+const emptyDraft: ComposerDraft = { text: "", attachments: [], workspaceRefs: [], pastedBlocks: [], sessionRefs: [] };
 
 export type Item =
   | { kind: "user"; id: string; text: string; submitText?: string; failed?: boolean; createdAt?: number }
@@ -96,6 +99,7 @@ interface State {
   live?: LiveStream;
   pendingUser?: string;
   discardTurn?: boolean;
+  draft: ComposerDraft;
   turnStartAt: number;
   turnTokens: number;
   turnTotalTokens: number;
@@ -119,6 +123,7 @@ export const initialState: State = {
   context: { used: 0, window: 0, sessionTokens: 0 },
   jobs: [],
   checkpoints: [],
+  draft: { ...emptyDraft },
   turnStartAt: 0,
   turnTokens: 0,
   turnTotalTokens: 0,
@@ -241,6 +246,7 @@ type Action =
   | { type: "local_notice"; level: "info" | "warn"; text: string }
   | { type: "clearApproval" }
   | { type: "clearAsk" }
+  | { type: "set_draft"; draft: ComposerDraft }
   | { type: "reset" };
 
 // ---- reducer helpers (unchanged logic) ----
@@ -678,7 +684,8 @@ export function reducer(s: State, a: Action): State {
     case "local_notice": return { ...s, running: false, turnActive: false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }] };
     case "clearApproval": return { ...s, approval: undefined, pendingPrompt: false };
     case "clearAsk": return { ...s, ask: undefined, pendingPrompt: false };
-    case "reset": return { ...initialState, meta: s.meta, context: { ...s.context, used: 0, sessionTokens: 0 }, balance: s.balance, effort: s.effort, jobs: s.jobs, sessionGen: s.sessionGen + 1 };
+    case "set_draft": return { ...s, draft: a.draft };
+    case "reset": return { ...initialState, draft: { ...emptyDraft }, meta: s.meta, context: { ...s.context, used: 0, sessionTokens: 0 }, balance: s.balance, effort: s.effort, jobs: s.jobs, sessionGen: s.sessionGen + 1 };
     case "event": return applyEvent(s, a.e);
     default: return s;
   }
@@ -1077,6 +1084,10 @@ export function useController() {
     if (tabId) dispatchTo(tabId, { type: "reset" });
   }, [activeTabId, bumpCheckpointRefreshSeq, dispatchTo]);
 
+  const setDraft = useCallback((tabId: string, draft: ComposerDraft) => {
+    dispatchTo(tabId, { type: "set_draft", draft });
+  }, [dispatchTo]);
+
   const listSessions = useCallback(async (): Promise<SessionMeta[]> => asArray<SessionMeta>(await app.ListSessions().catch(() => [])), []);
   const listTrashedSessions = useCallback(async (): Promise<SessionMeta[]> => asArray<SessionMeta>(await app.ListTrashedSessions().catch(() => [])), []);
   const resumeSession = useCallback(async (path: string, tabId?: string) => {
@@ -1283,7 +1294,7 @@ export function useController() {
     state: activeState,
     activeTabId,
     send, sendToTab, runShell, steer, notice, cancel, approve, answerQuestion, setControllerMode, setCollaborationMode, setToolApprovalMode, setGoal, clearGoal,
-    newSession, clearSession, listSessions, listTrashedSessions, resumeSession, openChannelSession, previewSession, deleteSession, restoreSession, purgeTrashedSession, renameSession,
+    newSession, clearSession, setDraft, listSessions, listTrashedSessions, resumeSession, openChannelSession, previewSession, deleteSession, restoreSession, purgeTrashedSession, renameSession,
     refreshMeta, pickWorkspace, switchWorkspace, compact, rewind, setModel, setEffort, setTokenMode,
     fetchMemory, remember, forget, saveDoc,
     switchTab, openProjectTab, openGlobalTab, openTopicSession, ensureBlankTab, closeTab, reorderTabs,

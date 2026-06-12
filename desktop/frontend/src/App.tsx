@@ -825,6 +825,7 @@ export default function App() {
     setGoal: setControllerGoal,
     clearGoal: clearControllerGoal,
     clearSession,
+    setDraft,
     listSessions,
     listTrashedSessions,
     resumeSession,
@@ -2992,6 +2993,7 @@ export default function App() {
               />
             )}
             <Composer
+              key={activeTabId}
               running={state.running}
               collaborationMode={collaborationMode}
               toolApprovalMode={toolApprovalMode}
@@ -3022,6 +3024,8 @@ export default function App() {
               turnTokens={state.turnTokens}
               retry={state.retry}
               transientDismissSignal={transientOverlayDismissSignal}
+              draft={state.draft}
+              onDraftChange={setDraft}
             />
             <StatusBar
               context={state.context}

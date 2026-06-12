@@ -11,7 +11,7 @@ import { SPINNER_WORDS, useI18n } from "../lib/i18n";
 import { detectShortcutPlatform, matchesShortcut } from "../lib/keyboardShortcuts";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
 import { useToast } from "../lib/toast";
-import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode } from "../lib/types";
+import { type CollaborationMode, type CommandInfo, type ComposerDraft, type ComposerInsertRequest, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode, type Attachment, type WorkspaceReference, type PastedBlock } from "../lib/types";
 import {
   formatWorkspaceReference,
   parseWorkspaceReference,
@@ -27,20 +27,9 @@ import { ModelSwitcher } from "./ModelSwitcher";
 import { Tooltip } from "./Tooltip";
 import { ComposerContextCard } from "./ComposerContextCard";
 
-interface Attachment {
-  path: string;
-  previewUrl?: string;
-  displayName?: string;
-}
-
 interface AttachmentDedupKey {
   hash: string;
   source: string;
-}
-
-interface WorkspaceReference {
-  path: string;
-  isDir?: boolean;
 }
 
 const LONG_PASTE_MIN_CHARS = 2000;
@@ -54,11 +43,6 @@ const PROMPT_HISTORY_PREFETCH_REMAINING = 3;
 // it; the real gap is a few ms, so keep it short or a deliberate quick second
 // Enter (submit) gets eaten too.
 const IME_CONFIRM_GRACE_MS = 100;
-
-type PastedBlock = {
-  label: string;
-  text: string;
-};
 
 type WebkitFileEntry = {
   isDirectory?: boolean;
@@ -350,6 +334,8 @@ export function Composer({
   turnTokens,
   retry,
   transientDismissSignal,
+  draft,
+  onDraftChange,
 }: {
   running: boolean;
   collaborationMode: CollaborationMode;
@@ -387,15 +373,17 @@ export function Composer({
   turnTokens?: number;
   retry?: { attempt: number; max: number };
   transientDismissSignal?: number;
+  draft: ComposerDraft;
+  onDraftChange?: (tabId: string, draft: ComposerDraft) => void;
 }) {
   const { t, locale } = useI18n();
   const { showToast } = useToast();
   const shortcutPlatform = useMemo(() => detectShortcutPlatform(), []);
   const now = useTick(running);
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [workspaceRefs, setWorkspaceRefs] = useState<WorkspaceReference[]>([]);
-  const [pastedBlocks, setPastedBlocks] = useState<PastedBlock[]>([]);
+  const [text, setText] = useState(draft.text);
+  const [attachments, setAttachments] = useState<Attachment[]>(draft.attachments);
+  const [workspaceRefs, setWorkspaceRefs] = useState<WorkspaceReference[]>(draft.workspaceRefs);
+  const [pastedBlocks, setPastedBlocks] = useState<PastedBlock[]>(draft.pastedBlocks);
   const [openPastedLabels, setOpenPastedLabels] = useState<string[]>([]);
   const [pendingPaste, setPendingPaste] = useState(0);
   const pastedBlocksRef = useRef<PastedBlock[]>([]);
@@ -414,7 +402,7 @@ export function Composer({
   const [showPastChats, setShowPastChats] = useState(false);
   const [pastChats, setPastChats] = useState<SessionMeta[]>([]);
   const [pastChatQuery, setPastChatQuery] = useState("");
-  const [sessionRefs, setSessionRefs] = useState<SessionReference[]>([]);
+  const [sessionRefs, setSessionRefs] = useState<SessionReference[]>(draft.sessionRefs);
   const [loadingPastChats, setLoadingPastChats] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [composerPrompt, setComposerPrompt] = useState<string | null>(null);
@@ -447,6 +435,34 @@ export function Composer({
   // workspace switches and discard stale responses (issue #3601).
   const cwdRef = useRef(cwd);
   cwdRef.current = cwd;
+  // Track latest composer state so the unmount cleanup can save it to per-tab state (#4133).
+  const draftRef = useRef<ComposerDraft>(draft);
+  draftRef.current = { text, attachments, workspaceRefs, pastedBlocks, sessionRefs };
+  // On unmount (tab switch via key={activeTabId}), persist the current draft — but
+  // only if anything actually changed. Reference equality works because every piece
+  // of state is initialised from draft.*, so untouched arrays share the same ref.
+  useEffect(() => {
+    return () => {
+      if (!tabId || !onDraftChange) return;
+      const cur = draftRef.current;
+      if (
+        cur.text === draft.text &&
+        cur.attachments === draft.attachments &&
+        cur.workspaceRefs === draft.workspaceRefs &&
+        cur.pastedBlocks === draft.pastedBlocks &&
+        cur.sessionRefs === draft.sessionRefs
+      ) return;
+      onDraftChange(tabId, {
+        text: cur.text,
+        attachments: cur.attachments,
+        workspaceRefs: cur.workspaceRefs,
+        pastedBlocks: cur.pastedBlocks,
+        sessionRefs: cur.sessionRefs,
+      });
+    };
+    // draft is the mount-time prop — captured once, stable for this instance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabId, onDraftChange]);
   const attachmentDedupRef = useRef(new DedupIndex());
   const attachmentDedupKeysRef = useRef<Record<string, AttachmentDedupKey>>({});
 
