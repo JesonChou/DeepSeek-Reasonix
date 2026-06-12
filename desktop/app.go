@@ -1523,7 +1523,8 @@ func (a *App) HistoryForTab(tabID string) []HistoryMessage {
 	if ctrl == nil {
 		return []HistoryMessage{}
 	}
-	msgs := ctrl.History()
+	ctrl.EmitCanonicalTodoState()
+	msgs := ctrl.HistoryWithCanonicalTodos()
 	return historyMessages(msgs, sessionDisplayResolver(controllerSessionDir(ctrl), ctrl.SessionPath()))
 }
 

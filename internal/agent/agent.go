@@ -745,6 +745,13 @@ func (a *Agent) setTodoState(todos []evidence.TodoItem) {
 	a.todoMu.Unlock()
 }
 
+// CanonicalTodoState returns a snapshot of the host-reconstructed task list.
+func (a *Agent) CanonicalTodoState() []evidence.TodoItem {
+	a.todoMu.Lock()
+	defer a.todoMu.Unlock()
+	return append([]evidence.TodoItem(nil), a.todoState...)
+}
+
 func (a *Agent) incompleteCanonicalTodos() ([]evidence.TodoStepMatch, bool) {
 	a.todoMu.Lock()
 	defer a.todoMu.Unlock()
@@ -828,6 +835,19 @@ func (a *Agent) emitTodoState(todos []evidence.TodoItem, itemIndex int) {
 	a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: t})
 	t.Output = "task list advanced by complete_step"
 	a.sink.Emit(event.Event{Kind: event.ToolResult, Tool: t})
+}
+
+// EmitCanonicalTodoState emits the current canonical todo list as a synthetic
+// todo_write event on the live event stream, so the frontend receives it after
+// a history reload (tab switch, reconnect).
+func (a *Agent) EmitCanonicalTodoState() {
+	a.todoMu.Lock()
+	todos := append([]evidence.TodoItem(nil), a.todoState...)
+	a.todoMu.Unlock()
+	if len(todos) == 0 {
+		return
+	}
+	a.emitTodoState(todos, 0)
 }
 
 // rebuildTodoState reconstructs the canonical task list from a transcript: the

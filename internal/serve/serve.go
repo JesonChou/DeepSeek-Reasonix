@@ -486,7 +486,7 @@ func historyMessages(msgs []provider.Message) []historyMessage {
 // if the client sends If-None-Match with the current ETag, the server returns
 // 304 Not Modified with no body, saving bandwidth on reconnects.
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
-	writeJSONCached(w, r, historyMessages(s.ctl().History()))
+	writeJSONCached(w, r, historyMessages(s.ctl().HistoryWithCanonicalTodos()))
 }
 
 // context returns the prompt-vs-window gauge numbers. Supports ETag caching

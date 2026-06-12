@@ -1932,6 +1932,41 @@ func (c *Controller) History() []provider.Message {
 	return c.executor.Session().Snapshot() // copy — a turn may be appending concurrently
 }
 
+// HistoryWithCanonicalTodos returns the session history with the host-reconstructed
+// canonical task list injected as a synthetic todo_write at the end.  Frontends
+// use this instead of History() so the TodoPanel reflects host advances that
+// were never persisted to the session file (initial load, tab switch, reconnect).
+func (c *Controller) HistoryWithCanonicalTodos() []provider.Message {
+	msgs := c.History()
+	if c.executor == nil {
+		return msgs
+	}
+	todos := c.executor.CanonicalTodoState()
+	if len(todos) == 0 {
+		return msgs
+	}
+	args, err := json.Marshal(map[string]any{"todos": todos})
+	if err != nil {
+		return msgs
+	}
+	msgs = append(msgs, provider.Message{
+		Role: provider.RoleAssistant,
+		ToolCalls: []provider.ToolCall{{
+			ID: "host-canonical-seed", Name: "todo_write", Arguments: string(args),
+		}},
+	})
+	return msgs
+}
+
+// EmitCanonicalTodoState emits the current canonical task list as a synthetic
+// todo_write event to the live event stream, so the frontend receives the
+// canonical state alongside (and after) the history response.
+func (c *Controller) EmitCanonicalTodoState() {
+	if c.executor != nil {
+		c.executor.EmitCanonicalTodoState()
+	}
+}
+
 // ContextSnapshot returns (promptTokens, contextWindow) from the most recent
 // turn. Both zero means no data yet — a gauge hides itself.
 func (c *Controller) ContextSnapshot() (int, int) {
