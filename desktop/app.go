@@ -961,6 +961,7 @@ func (a *App) Fork(turn int) (TabMeta, error) {
 	model := sourceTab.model
 	effort := cloneStringPtr(sourceTab.effort)
 	mode := currentTabMode(sourceTab)
+	toolApprovalMode := currentTabToolApprovalMode(sourceTab)
 	disabledMCP := cloneServerViewMap(sourceTab.disabledMCP)
 	mcpOrder := append([]string(nil), sourceTab.mcpOrder...)
 	a.mu.RUnlock()
@@ -990,17 +991,18 @@ func (a *App) Fork(turn int) (TabMeta, error) {
 	a.mu.Lock()
 	tabID := a.newUniqueTabIDLocked()
 	tab := &WorkspaceTab{
-		ID:            tabID,
-		Scope:         scope,
-		WorkspaceRoot: workspaceRoot,
-		TopicID:       topicID,
-		TopicTitle:    topicTitle,
-		SessionPath:   newPath,
-		model:         model,
-		effort:        effort,
-		mode:          mode,
-		disabledMCP:   disabledMCP,
-		mcpOrder:      mcpOrder,
+		ID:               tabID,
+		Scope:            scope,
+		WorkspaceRoot:    workspaceRoot,
+		TopicID:          topicID,
+		TopicTitle:       topicTitle,
+		SessionPath:      newPath,
+		model:            model,
+		effort:           effort,
+		mode:             mode,
+		toolApprovalMode: toolApprovalMode,
+		disabledMCP:      disabledMCP,
+		mcpOrder:         mcpOrder,
 	}
 	tab.sink = &tabEventSink{tabID: tabID, app: a}
 	a.tabs[tabID] = tab
