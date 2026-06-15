@@ -3288,10 +3288,12 @@ func (a *App) ContextUsageForTab(tabID string) ContextInfo {
 // BalanceInfo is the wallet-balance readout for the status bar. Available is true
 // only when a balance was fetched; Display is the formatted amount (e.g. "¥110.00")
 // and is "" when the active provider declares no balance_url — the frontend then
-// omits the readout. Err carries a fetch failure for an optional tooltip.
+// omits the readout. Currency is the display symbol ("¥", "$", …). Err carries a
+// fetch failure for an optional tooltip.
 type BalanceInfo struct {
 	Available bool   `json:"available"`
 	Display   string `json:"display"`
+	Currency  string `json:"currency,omitempty"`
 	Err       string `json:"err,omitempty"`
 }
 
@@ -3315,7 +3317,7 @@ func (a *App) BalanceForTab(tabID string) BalanceInfo {
 	if b == nil {
 		return BalanceInfo{} // provider declares no balance endpoint
 	}
-	return BalanceInfo{Available: true, Display: b.Display()}
+	return BalanceInfo{Available: true, Display: b.Display(), Currency: b.Currency()}
 }
 
 // JobView is one running background job (bash/task started with

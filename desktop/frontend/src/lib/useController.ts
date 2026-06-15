@@ -116,7 +116,7 @@ export const initialState: State = {
   turnCost: 0,
   sessionTokens: 0,
   sessionCost: 0,
-  sessionCurrency: "¥",
+  sessionCurrency: "",
   seq: 0,
 };
 
@@ -507,7 +507,7 @@ function applyEvent(s: State, e: WireEvent): State {
       const usageCost = e.usage?.cost ?? e.usage?.costUsd ?? 0;
       const turnCost = s.turnCost + usageCost;
       const sessionCost = s.sessionCost + usageCost;
-      const sessionCurrency = e.usage?.currency || s.sessionCurrency || "¥";
+      const sessionCurrency = s.sessionCurrency || e.usage?.currency || "¥";
       const usage = updateContextGauge ? e.usage : s.usage ?? e.usage;
       return { ...s, usage, context: { ...s.context, used, sessionTokens }, turnTokens, turnTotalTokens, turnCost, sessionTokens, sessionCost, sessionCurrency };
     }
@@ -595,7 +595,7 @@ export function reducer(s: State, a: Action): State {
         : s.sessionTokens;
       return { ...s, context: a.context, sessionTokens };
     }
-    case "balance": return { ...s, balance: a.balance };
+    case "balance": return { ...s, balance: a.balance, sessionCurrency: a.balance.currency || s.sessionCurrency || "" };
     case "effort": return { ...s, effort: a.effort };
     case "jobs": return { ...s, jobs: a.jobs };
     case "checkpoints": return { ...s, checkpoints: a.checkpoints };
@@ -618,7 +618,7 @@ export function reducer(s: State, a: Action): State {
     case "local_notice": return { ...s, running: false, turnActive: false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }] };
     case "clearApproval": return { ...s, approval: undefined };
     case "clearAsk": return { ...s, ask: undefined };
-    case "reset": return { ...initialState, meta: s.meta, context: { ...s.context, used: 0, sessionTokens: 0 }, balance: s.balance, effort: s.effort, jobs: s.jobs };
+    case "reset": return { ...initialState, meta: s.meta, context: { ...s.context, used: 0, sessionTokens: 0 }, balance: s.balance, effort: s.effort, jobs: s.jobs, sessionCurrency: s.sessionCurrency };
     case "event": return applyEvent(s, a.e);
     default: return s;
   }

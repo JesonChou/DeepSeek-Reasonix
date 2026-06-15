@@ -117,12 +117,25 @@ func (b *Balance) Display() string {
 	if b == nil || len(b.Infos) == 0 {
 		return ""
 	}
-	pick := b.Infos[0]
-	for _, i := range b.Infos {
+	pick := primaryInfo(b.Infos)
+	return symbol(pick.Currency) + strings.TrimSpace(pick.TotalBalance)
+}
+
+// Currency returns the primary currency symbol (e.g. "¥", "$") for the balance.
+// It prefers CNY, then the first reported currency. "" when there's nothing.
+func (b *Balance) Currency() string {
+	if b == nil || len(b.Infos) == 0 {
+		return ""
+	}
+	return symbol(primaryInfo(b.Infos).Currency)
+}
+
+func primaryInfo(infos []Info) Info {
+	pick := infos[0]
+	for _, i := range infos {
 		if strings.EqualFold(i.Currency, "CNY") {
-			pick = i
-			break
+			return i
 		}
 	}
-	return symbol(pick.Currency) + strings.TrimSpace(pick.TotalBalance)
+	return pick
 }
