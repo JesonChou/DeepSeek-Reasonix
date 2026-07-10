@@ -906,6 +906,7 @@ func (a *App) submitToTab(tabID, input string, fromBridge bool) error {
 		return err
 	}
 	a.ensureTabTopicIndexedForUserTurn(tab)
+	ctrl.ResetSteer()
 	ctrl.SubmitDisplay(input, input)
 	a.finishTabTurnStart(tab, ctrl)
 	return nil

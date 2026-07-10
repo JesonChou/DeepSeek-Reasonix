@@ -802,17 +802,19 @@ func (a *Agent) consumeSteer() (string, bool) {
 	return t, true
 }
 
-func (a *Agent) clearSteerQueue() {
-	a.steerMu.Lock()
-	defer a.steerMu.Unlock()
-	a.steerQueue = nil
-	a.steerConsumed = false
-}
-
 func (a *Agent) steerQueueLen() int {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
 	return len(a.steerQueue)
+}
+
+// ResetSteer clears all queued steer items. Call this when an explicit new
+// user turn supersedes any pending mid-turn guidance from a previous turn.
+func (a *Agent) ResetSteer() {
+	a.steerMu.Lock()
+	defer a.steerMu.Unlock()
+	a.steerQueue = nil
+	a.steerConsumed = false
 }
 
 // CompactRatio returns the fraction of the window at which auto-compaction
@@ -1035,9 +1037,20 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		}
 		return 1
 	}
-	defer a.clearSteerQueue()
+	// Preserve late-arriving steer items across turn boundaries.
+	// During the turn loop, consumeSteer() drains the queue
+	// injectively. Any items queued after the last consume (e.g.
+	// during final-answer emission or just before defer cleanups)
+	// must survive into the next turn - clearing them here would
+	// silently drop user guidance that arrived near turn-end.
+	//
+	// steerConsumed is reset only when there are pending items, so
+	// the frontend's SteerConsumed poll remains accurate between
+	// turns when the queue is genuinely empty.
 	a.steerMu.Lock()
-	a.steerConsumed = false
+	if len(a.steerQueue) > 0 {
+		a.steerConsumed = false
+	}
 	a.steerMu.Unlock()
 	if a.evidence != nil {
 		a.evidence.Reset()

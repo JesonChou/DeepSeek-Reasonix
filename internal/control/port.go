@@ -61,6 +61,7 @@ type TurnControl interface {
 	Cancel()
 	Steer(text string)
 	SteerConsumed() bool
+	ResetSteer()
 	Running() bool
 	CancelRequested() bool
 	RuntimeStatus() RuntimeStatus

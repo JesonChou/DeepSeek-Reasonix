@@ -1657,6 +1657,17 @@ func (c *Controller) SteerConsumed() bool {
 	return true
 }
 
+// ResetSteer clears all queued steer items. Call this when an explicit new
+// user turn supersedes any pending mid-turn guidance from a previous turn.
+func (c *Controller) ResetSteer() {
+	c.mu.Lock()
+	exec := c.executor
+	c.mu.Unlock()
+	if exec != nil {
+		exec.ResetSteer()
+	}
+}
+
 // Ask implements agent.Asker: it emits an AskRequest and blocks until
 // AnswerQuestion(ID, …) answers or ctx is cancelled. promptMu serialises it
 // against tool-approval prompts so at most one user prompt is outstanding.
