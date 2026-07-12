@@ -4213,10 +4213,21 @@ a[href] {
   align-items: center;
   gap: 6px;
   min-height: 24px;
+  padding: 2px 7px;
+  border: none;
+  background: none;
+  cursor: pointer;
   color: var(--fg-faint);
   font-size: 13px;
   font-weight: 560;
   line-height: 1.4;
+  border-radius: 6px;
+  -webkit-app-region: no-drag;
+}
+
+.turn-collapse__reasoning-head:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
 
 .turn-collapse__reasoning-head > svg:first-child {
@@ -4316,7 +4327,8 @@ a[href] {
   color: var(--fg-faint);
 }
 .tool__head[data-running]:hover,
-.reasoning__head[data-running]:hover {
+.reasoning__head[data-running]:hover,
+.turn-collapse__reasoning-head[data-running]:hover {
   animation-play-state: paused;
   background: none;
   color: var(--fg);
@@ -4324,7 +4336,8 @@ a[href] {
 .tool__head[data-running]:hover .tool__chevron,
 .tool__head[data-running]:hover .tool__duration,
 .reasoning__head[data-running]:hover svg,
-.reasoning__head[data-running]:hover .reasoning__meta {
+.reasoning__head[data-running]:hover .reasoning__meta,
+.turn-collapse__reasoning-head[data-running]:hover svg {
   color: var(--fg);
 }
 @keyframes shimmer-sweep {
@@ -28834,7 +28847,9 @@ body > .mermaid-diagram--fullscreen {
 }
 
 .app--creation .reasoning__head,
-:root[data-theme-style] .app--creation .reasoning__head {
+.app--creation .turn-collapse__reasoning-head,
+:root[data-theme-style] .app--creation .reasoning__head,
+:root[data-theme-style] .app--creation .turn-collapse__reasoning-head {
   gap: 4px;
   padding: 0;
   color: color-mix(in srgb, var(--fg-dim) 72%, transparent);
