@@ -1728,6 +1728,9 @@ func (c *Controller) Steer(text string) {
 	running := c.running
 	c.mu.Unlock()
 	if exec == nil {
+		// No executor — controller is not yet initialised or already closed.
+		// Fall back to a new turn so the user still gets a response.
+		go func() { c.SubmitDisplay(text, text) }()
 		return
 	}
 	if running {
