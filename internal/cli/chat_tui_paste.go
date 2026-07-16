@@ -387,3 +387,21 @@ func pastedFileRef(content string) (string, bool) {
 	}
 	return "@" + control.EscapeRefPath(path), true
 }
+
+const maxUndoStack = 50
+
+// pushUndo saves the current input value onto the undo stack so it can be
+// restored later via Ctrl+Z. The stack is capped at maxUndoStack entries:
+// exceeding entries push the oldest value off the bottom (FIFO eviction)
+// so repeated pastes don't grow unbounded.
+func (m *chatTUI) pushUndo(val string) {
+	if m.undoStack == nil {
+		m.undoStack = make([]string, 0, maxUndoStack)
+	}
+	if len(m.undoStack) >= maxUndoStack {
+		// Drop oldest entry to stay under the cap.
+		m.undoStack = append(m.undoStack[1:], val)
+		return
+	}
+	m.undoStack = append(m.undoStack, val)
+}

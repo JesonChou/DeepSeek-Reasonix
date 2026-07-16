@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -2987,6 +2988,14 @@ func TestCtrlZResetsMouseTrackingBeforeSuspend(t *testing.T) {
 	ctrlZ := tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl}
 
 	_, cmd := m.Update(ctrlZ)
+	if runtime.GOOS == "windows" {
+		// On Windows Ctrl+Z triggers undo (no-op when undo stack is empty).
+		// finalize with no cmds returns nil.
+		if cmd != nil {
+			t.Fatalf("expected no command from Ctrl+Z on Windows with empty undo, got %T", cmd)
+		}
+		return
+	}
 	if cmd == nil {
 		t.Fatal("expected Ctrl+Z to return a suspend sequence")
 	}

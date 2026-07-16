@@ -77,6 +77,11 @@ type chatTUI struct {
 	submittedInputDraft  string
 	pastedBlocks         []pastedBlock
 	nextPasteID          int
+	// undoStack saves input values before each paste so Ctrl+Z can undo
+	// them one at a time (LIFO). Each paste pushes the pre-paste value.
+	// On Windows Ctrl+Z pops the stack; on Unix Ctrl+Z still suspends
+	// the process.
+	undoStack []string
 
 	state    tuiState
 	runStart time.Time
@@ -1055,6 +1060,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, finalize(m, cmds)
 		}
 
+		m.pushUndo(pasteBefore)
 	case tea.KeyPressMsg:
 		// Any keystroke dismisses a finished selection (copy is a right-click),
 		// with a few exceptions: Ctrl/Super/Meta+C copies the selection, the
@@ -1113,6 +1119,17 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 			return m, finalize(m, cmds)
 		case "ctrl+z":
+			if runtime.GOOS == "windows" {
+				if len(m.undoStack) > 0 {
+					prev := m.undoStack[len(m.undoStack)-1]
+					m.undoStack = m.undoStack[:len(m.undoStack)-1]
+					m.input.Reset()
+					m.input.InsertString(prev)
+					m.growInputToFit()
+					m.updateCompletion()
+				}
+				return m, finalize(m, cmds)
+			}
 			return m, suspendWithMouseReset()
 		}
 		// From this point on the key belongs to the active control rather than
