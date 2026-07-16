@@ -4727,6 +4727,144 @@ a[href] {
   position: relative;
 }
 
+/* ── line-numbered code viewer ─────────────────────────────────────────── */
+.code--lines {
+  padding: 0;
+}
+.code-lines-wrap {
+  font-family: var(--font-mono);
+  font-size: var(--font-code);
+  line-height: 1.55;
+  color: var(--fg);
+}
+.code-line-row {
+  display: flex;
+  align-items: flex-start;
+  min-height: calc(1em * 1.55);
+}
+.code-line-row--match {
+  background: rgba(255, 193, 7, 0.1);
+}
+.code-line-row--dim {
+  opacity: 0.35;
+}
+.code-line-row--current {
+  background: rgba(255, 193, 7, 0.22);
+  outline: 1px solid rgba(255, 193, 7, 0.35);
+  outline-offset: -1px;
+}
+.code-line-ln {
+  flex-shrink: 0;
+  padding: 0 12px 0 16px;
+  text-align: right;
+  color: var(--fg-faint);
+  user-select: none;
+  -webkit-user-select: none;
+  white-space: pre;
+  line-height: inherit;
+  border-right: 1px solid var(--border-soft);
+}
+.code-line-text {
+  flex: 1;
+  padding: 0 13px;
+  white-space: pre;
+  line-height: inherit;
+  overflow-x: auto;
+}
+
+/* ── search bar (Ctrl+F) ───────────────────────────────────────────────── */
+.code-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--bg-elev-1);
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-sans);
+  font-size: var(--font-sm);
+}
+.code-search__input {
+  flex: 1;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: inherit;
+  padding: 2px 0;
+}
+.code-search__input::placeholder {
+  color: var(--fg-faint);
+}
+.code-search__count {
+  color: var(--fg-faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.code-search__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  font-size: 12px;
+}
+.code-search__close:hover {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+.code-search__nav {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  padding: 0;
+}
+.code-search__nav:hover {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+.code-search__toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 0 4px;
+}
+.code-search__toggle:hover {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+.code-search__toggle--on {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+/* Inline search match highlight — bright background on the exact term */
+.code-search-hl {
+  background: rgba(255, 193, 7, 0.45);
+  color: inherit;
+  border-radius: 2px;
+}
+
 /* ── Mermaid diagram renderer ───────────────────────────────────────────── */
 .mermaid-diagram {
   position: relative;
@@ -8611,6 +8749,16 @@ body > .mermaid-diagram--fullscreen {
   border: 0;
   border-radius: 0;
   overflow: auto;
+}
+/* line-numbered code fills the preview body */
+.workspace-preview__body--code .code--lines {
+  padding: 0;
+  border-radius: 0;
+}
+.workspace-preview__body--code .code-block__wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .workspace-preview__body .code-block,
 .workspace-preview__body .code {

@@ -19,6 +19,16 @@ const SHELL_PREVIEW_LINES = 10;
 const ERROR_SUMMARY_MAX_CHARS = 140;
 const ERROR_DETAILS_THRESHOLD = 220;
 
+// read_file / read_session output prefixes each line with right-aligned
+// 1-based line numbers and a → arrow (e.g. `   42→code`). Strip them when
+// we render with our own line-number gutter.
+const READ_FILE_LINE_PREFIX = /^ *\d+→/gm;
+const READ_FILE_TOOLS = new Set(["read_file", "read_session"]);
+
+function stripReadFileLineNumbers(output: string): string {
+  return output.replace(READ_FILE_LINE_PREFIX, "");
+}
+
 function pretty(json: string): string {
   try {
     return JSON.stringify(JSON.parse(json), null, 2);
@@ -262,7 +272,11 @@ export const ToolCard = memo(function ToolCard({ item, subcalls, tabId, displayN
             {effectiveArgs && <CodeViewer value={pretty(effectiveArgs)} language="json" maxHeight={180} />}
             {displayOutput && (
               <>
-                <CodeViewer value={displayOutput} maxHeight={280} />
+                <CodeViewer
+                  value={READ_FILE_TOOLS.has(item.name) ? stripReadFileLineNumbers(displayOutput) : displayOutput}
+                  maxHeight={280}
+                  showLineNumbers={READ_FILE_TOOLS.has(item.name)}
+                />
                 {item.truncated && <div className="tool__note">{t("tool.truncated")}</div>}
               </>
             )}
