@@ -689,6 +689,7 @@ export function Composer({
   const taRef = useRef<HTMLTextAreaElement>(null);
   const richInputRef = useRef<RichComposerInputHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pasteUndoRef = useRef<string[]>([]);
   const composerCardRef = useRef<HTMLDivElement>(null);
   const contentMenuAnchorRef = useRef<HTMLButtonElement>(null);
   const intentMenuAnchorRef = useRef<HTMLButtonElement>(null);
@@ -1895,14 +1896,44 @@ export function Composer({
       setInvocations(next.invocations);
       setComposerSelection(start + label.length);
     } else {
-      // Short paste: insert the raw text directly into state.
+      // Short paste: use browser-native DOM insertion so the undo stack
+      // records the paste (Ctrl+Z works). For contenteditable we use
+      // execCommand("insertText"); for plain textarea we use setRangeText
+      // followed by a React state update.
       resetPromptHistoryNavigation();
-      const next = replaceInvocationTextRange(text, invocationsRef.current, start, end, normalizedPasted, selection.afterInvocationId);
-      textRef.current = next.text;
-      invocationsRef.current = next.invocations;
-      setText(next.text);
-      setInvocations(next.invocations);
-      setComposerSelection(start + normalizedPasted.length);
+      pasteUndoRef.current.push(text);
+      if (invocationsRef.current.length > 0) {
+        // RichComposerInput (contenteditable): execCommand replaces the
+        // current selection and is natively undoable. On success the
+        // onInput → syncFromDom() path syncs text + invocations back
+        // to React state.
+        if (!document.execCommand("insertText", false, normalizedPasted)) {
+          // execCommand stub (JSDOM): fall back to React state update.
+          const next = replaceInvocationTextRange(text, invocationsRef.current, start, end, normalizedPasted, selection.afterInvocationId);
+          textRef.current = next.text;
+          invocationsRef.current = next.invocations;
+          setText(next.text);
+          setInvocations(next.invocations);
+          setComposerSelection(start + normalizedPasted.length);
+        }
+      } else {
+        // Plain textarea: use setRangeText (recorded in undo history),
+        // then update React state so the controlled input stays in sync.
+        const ta = taRef.current;
+        if (ta && typeof ta.setRangeText === "function") {
+          ta.setRangeText(normalizedPasted, start, end, "end");
+          ta.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        // Always update React state — needed for JSDOM where manually-
+        // dispatched events may not trigger React's onChange, and safe
+        // in real browsers where setRangeText already updated the DOM.
+        const next = replaceInvocationTextRange(text, invocationsRef.current, start, end, normalizedPasted, selection.afterInvocationId);
+        textRef.current = next.text;
+        invocationsRef.current = next.invocations;
+        setText(next.text);
+        setInvocations(next.invocations);
+        setComposerSelection(start + normalizedPasted.length);
+      }
     }
   };
 
@@ -1983,6 +2014,7 @@ export function Composer({
       focusInputRange(start + label.length);
     } else {
       resetPromptHistoryNavigation();
+      pasteUndoRef.current.push(text);
       const current = textRef.current;
       const next = current.slice(0, start) + normalizedPasted + current.slice(end);
       textRef.current = next;
@@ -2019,6 +2051,7 @@ export function Composer({
     }
     if (cut) {
       if (sourceDraftKey === activeDraftKeyRef.current) resetPromptHistoryNavigation();
+      pasteUndoRef.current.push(text);
       replaceInputRange("", selection.from, selection.to, sourceDraftKey);
     } else if (sourceDraftKey === activeDraftKeyRef.current) {
       focusInputRange(selection.from, selection.to);
@@ -2736,6 +2769,21 @@ export function Composer({
     if (e.key === "Escape" && running) {
       e.preventDefault();
       handleCancel();
+    }
+
+    // Ctrl+Z: if there is a paste on the undo stack, pop and restore.
+    // Otherwise let the browser handle native text undo.
+    if (e.ctrlKey && e.key === "z" && !composing) {
+      const stack = pasteUndoRef.current;
+      if (stack.length > 0) {
+        e.preventDefault();
+        const prev = stack.pop()!;
+        if (prev !== undefined) {
+          textRef.current = prev;
+          setText(prev);
+          setComposerSelection(prev.length);
+        }
+      }
     }
   };
 
@@ -3553,6 +3601,7 @@ export function Composer({
                   style={textareaStyle}
                   onChange={(nextText, nextInvocations) => {
                     resetPromptHistoryNavigation();
+      pasteUndoRef.current.push(text);
                     const hadInvocations = invocationsRef.current.length > 0;
                     textRef.current = nextText;
                     invocationsRef.current = nextInvocations;
@@ -3593,6 +3642,7 @@ export function Composer({
                   value={text}
                   onChange={(e) => {
                     resetPromptHistoryNavigation();
+      pasteUndoRef.current.push(text);
                     textRef.current = e.target.value;
                     setText(e.target.value);
                     if (composerPrompt) setComposerPrompt(null);
