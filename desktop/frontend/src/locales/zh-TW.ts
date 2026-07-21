@@ -115,7 +115,7 @@ export const zhTW: Record<DictKey, string> = {
   "workspace.pickFile": "從檔案樹中選擇一個檔案。",
   "workspace.loading": "正在載入檔案…",
   "workspace.binary": "暫不支援預覽二進位檔案。",
-  "workspace.truncated": "預覽已截斷到前 256 KB。",
+  "workspace.truncated": "預覽已截斷到前 2 MiB。",
   "workspace.addSelectionToChat": "新增到聊天",
   "workspace.addFileReferenceToChat": "新增檔案引用",
   "workspace.addFolderReferenceToChat": "新增資料夾引用",

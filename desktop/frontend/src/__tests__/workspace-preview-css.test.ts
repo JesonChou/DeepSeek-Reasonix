@@ -7,6 +7,12 @@ import { JSDOM } from "jsdom";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const styles = readFileSync(resolve(testDir, "../styles.css"), "utf8");
+const appGo = readFileSync(resolve(testDir, "../../../app.go"), "utf8");
+const localeNotices = [
+  [readFileSync(resolve(testDir, "../locales/en.ts"), "utf8"), '"workspace.truncated": "Preview truncated to the first 2 MiB."'],
+  [readFileSync(resolve(testDir, "../locales/zh.ts"), "utf8"), '"workspace.truncated": "预览已截断到前 2 MiB。"'],
+  [readFileSync(resolve(testDir, "../locales/zh-TW.ts"), "utf8"), '"workspace.truncated": "預覽已截斷到前 2 MiB。"'],
+];
 
 let passed = 0;
 let failed = 0;
@@ -94,6 +100,21 @@ eq(
   "preview-only mode keeps a narrow tree toggle rail",
 );
 eq(finalDeclaration(".workspace-panel--tree-hidden .workspace-preview", "grid-column"), "2", "preview sits beside the rail");
+eq(
+  /const filePreviewLimit = 2 \* 1024 \* 1024/.test(appGo),
+  true,
+  "backend workspace preview limit remains 2 MiB",
+);
+eq(
+  localeNotices.every(([source, expected]) => source.includes(expected)),
+  true,
+  "all locale truncation notices match the 2 MiB backend limit",
+);
+eq(
+  localeNotices.every(([source]) => !source.includes("256 KB")),
+  true,
+  "locale truncation notices do not retain the previous 256 KB limit",
+);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

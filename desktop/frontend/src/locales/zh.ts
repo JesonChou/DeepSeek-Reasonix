@@ -192,7 +192,7 @@ export const zh: Record<DictKey, string> = {
   "workspace.pickFile": "从文件树中选择一个文件。",
   "workspace.loading": "正在加载文件…",
   "workspace.binary": "暂不支持预览二进制文件。",
-  "workspace.truncated": "预览已截断到前 256 KB。",
+  "workspace.truncated": "预览已截断到前 2 MiB。",
   "workspace.addSelectionToChat": "添加到聊天",
   "workspace.addFileReferenceToChat": "添加文件引用",
   "workspace.addFolderReferenceToChat": "添加文件夹引用",

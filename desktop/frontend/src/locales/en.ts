@@ -191,7 +191,7 @@ export const en = {
   "workspace.pickFile": "Choose a file from the tree.",
   "workspace.loading": "Loading file…",
   "workspace.binary": "Binary file preview is not available.",
-  "workspace.truncated": "Preview truncated to the first 256 KB.",
+  "workspace.truncated": "Preview truncated to the first 2 MiB.",
   "workspace.addSelectionToChat": "Add to Chat",
   "workspace.addFileReferenceToChat": "Add file reference",
   "workspace.addFolderReferenceToChat": "Add folder reference",
