@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"reasonix/internal/event"
 	"reasonix/internal/nilutil"
@@ -301,8 +302,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		}
 		// A planner failure must not take down the turn: the executor is
 		// healthy and owns the full tool set, so degrade to single-model for
-		// this turn (mirroring the auto-plan classifier's fallback to the
-		// heuristic when it errors).
+		// this turn.
 		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: plannerFallbackNotice, Detail: "planner failed; running the executor without a plan: " + err.Error(), Source: event.UsageSourcePlanner})
 		c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Source: event.UsageSourceExecutor})
 		return c.executor.Run(ctx, input)
@@ -675,7 +675,7 @@ func (c *Coordinator) persistExecutorNoOp(ctx context.Context, input, plan strin
 	if c == nil || c.executor == nil || c.executor.session == nil {
 		return
 	}
-	c.executor.session.Add(provider.Message{Role: provider.RoleUser, Content: c.executor.withTurnPreferences(input), Images: userImages(ctx)})
+	c.executor.session.Add(provider.Message{Role: provider.RoleUser, Content: c.executor.withTurnPreferences(input), Images: userImages(ctx), CreatedAt: time.Now().UnixMilli()})
 	c.executor.session.Add(provider.Message{Role: provider.RoleAssistant, Content: plan})
 }
 

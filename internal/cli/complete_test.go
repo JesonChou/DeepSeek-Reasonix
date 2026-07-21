@@ -489,23 +489,6 @@ func TestSlashArgCompletionLanguage(t *testing.T) {
 	}
 }
 
-func TestSlashArgCompletionAutoPlan(t *testing.T) {
-	m := newTestChatTUI()
-	m.input.SetValue("/auto-plan ")
-	m.updateCompletion()
-	if !m.completion.active || m.completion.kind != compSlashArg {
-		t.Fatalf("/auto-plan should open arg completion: %+v", m.completion)
-	}
-	for _, want := range []string{"off", "on"} {
-		if !hasLabel(m.completion.items, want) {
-			t.Fatalf("/auto-plan completion missing %q: %v", want, labels(m.completion.items))
-		}
-	}
-	if hasLabel(m.completion.items, "ask") {
-		t.Fatalf("/auto-plan completion should not include legacy ask: %v", labels(m.completion.items))
-	}
-}
-
 func TestSlashArgCompletionReasoningLanguage(t *testing.T) {
 	m := newTestChatTUI()
 	m.input.SetValue("/reasoning-language ")
@@ -520,20 +503,6 @@ func TestSlashArgCompletionReasoningLanguage(t *testing.T) {
 	}
 	if hasLabel(m.completion.items, "中文") {
 		t.Fatalf("/reasoning-language completion should expose only auto|zh|en: %v", labels(m.completion.items))
-	}
-}
-
-func TestSlashArgCompletionMemoryV5(t *testing.T) {
-	m := newTestChatTUI()
-	m.input.SetValue("/memory-v5 ")
-	m.updateCompletion()
-	if !m.completion.active || m.completion.kind != compSlashArg {
-		t.Fatalf("/memory-v5 should open arg completion: %+v", m.completion)
-	}
-	for _, want := range []string{"status", "off", "observe", "compact", "on", "learnings"} {
-		if !hasLabel(m.completion.items, want) {
-			t.Fatalf("/memory-v5 completion missing %q: %v", want, labels(m.completion.items))
-		}
 	}
 }
 

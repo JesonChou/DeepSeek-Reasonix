@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -18,15 +17,6 @@ import (
 	"reasonix/internal/provider"
 	"reasonix/internal/sandbox"
 )
-
-type captureTurnRunner struct {
-	inputs []string
-}
-
-func (r *captureTurnRunner) Run(_ context.Context, input string) error {
-	r.inputs = append(r.inputs, input)
-	return nil
-}
 
 func TestWithFreshSystemPromptReplacesExistingSystemMessage(t *testing.T) {
 	msgs := []provider.Message{
@@ -81,6 +71,29 @@ func TestProviderViewFromEntry_FiltersNonChatModels(t *testing.T) {
 	}
 	if !view.VisionModelsSet {
 		t.Fatal("ProviderView.VisionModelsSet = false, want true for configured vision_models")
+	}
+}
+
+func TestProviderModelOverridesPreservePerModelContextWindow(t *testing.T) {
+	overrides := map[string]config.ProviderModelOverride{
+		"short-model": {ContextWindow: 32_768},
+		"long-model":  {ContextWindow: 1_000_000},
+		"removed":     {ContextWindow: 8_192},
+	}
+	models := []string{"short-model", "long-model"}
+
+	view := providerModelOverridesForView(overrides, models)
+	if len(view) != 2 || view[0].Model != "long-model" || view[0].ContextWindow != 1_000_000 || view[1].Model != "short-model" || view[1].ContextWindow != 32_768 {
+		t.Fatalf("provider model override view = %+v", view)
+	}
+
+	view[0].ContextWindow = -1
+	saved := providerModelOverridesForSave(view, models)
+	if _, ok := saved["long-model"]; ok {
+		t.Fatalf("non-positive context-only override should be removed: %+v", saved)
+	}
+	if got := saved["short-model"].ContextWindow; got != 32_768 {
+		t.Fatalf("saved short-model context window = %d, want 32768", got)
 	}
 }
 
@@ -861,136 +874,19 @@ func TestSetReasoningLanguageUpdatesLiveTabControllers(t *testing.T) {
 	}
 }
 
-func TestSetAutoPlanUpdatesLiveTabControllers(t *testing.T) {
+func TestSetAutoPlanCompatibilityCannotReenableRetiredFeature(t *testing.T) {
 	isolateDesktopUserDirs(t)
 
 	app := NewApp()
-	userRunner := &captureTurnRunner{}
-	projectRunner := &captureTurnRunner{}
-	userCtrl := control.New(control.Options{AutoPlan: "on", Runner: userRunner})
-	projectCtrl := control.New(control.Options{AutoPlan: "on", Runner: projectRunner})
-	app.tabs = map[string]*WorkspaceTab{
-		"user": {
-			ID:          "user",
-			Scope:       "global",
-			Ctrl:        userCtrl,
-			Ready:       true,
-			disabledMCP: map[string]ServerView{},
-		},
-		"project": {
-			ID:            "project",
-			Scope:         "project",
-			WorkspaceRoot: t.TempDir(),
-			Ctrl:          projectCtrl,
-			Ready:         true,
-			disabledMCP:   map[string]ServerView{},
-		},
-	}
-	app.activeTabID = "user"
-
 	if err := app.SetAutoPlan("off"); err != nil {
-		t.Fatalf("SetAutoPlan: %v", err)
+		t.Fatalf("SetAutoPlan(off): %v", err)
 	}
-
-	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
-	if err := userCtrl.RunTurn(context.Background(), input); err != nil {
-		t.Fatal(err)
+	if err := app.SetAutoPlan("on"); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("SetAutoPlan(on) error = %v, want retired error", err)
 	}
-	if err := projectCtrl.RunTurn(context.Background(), input); err != nil {
-		t.Fatal(err)
-	}
-	if len(userRunner.inputs) != 1 || strings.HasPrefix(userRunner.inputs[0], control.PlanModeMarker) {
-		t.Fatalf("user tab should use updated auto_plan=off, inputs=%q", userRunner.inputs)
-	}
-	if len(projectRunner.inputs) != 1 || strings.HasPrefix(projectRunner.inputs[0], control.PlanModeMarker) {
-		t.Fatalf("project tab without override should use updated auto_plan=off, inputs=%q", projectRunner.inputs)
-	}
-}
-
-func TestSetAutoPlanIgnoresProjectOverrideForLiveTab(t *testing.T) {
-	isolateDesktopUserDirs(t)
-	projectRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(projectRoot, "reasonix.toml"), []byte("[agent]\nauto_plan = \"on\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	app := NewApp()
-	userRunner := &captureTurnRunner{}
-	projectRunner := &captureTurnRunner{}
-	userCtrl := control.New(control.Options{AutoPlan: "on", Runner: userRunner})
-	projectCtrl := control.New(control.Options{AutoPlan: "on", Runner: projectRunner})
-	app.tabs = map[string]*WorkspaceTab{
-		"user": {
-			ID:          "user",
-			Scope:       "global",
-			Ctrl:        userCtrl,
-			Ready:       true,
-			disabledMCP: map[string]ServerView{},
-		},
-		"project": {
-			ID:            "project",
-			Scope:         "project",
-			WorkspaceRoot: projectRoot,
-			Ctrl:          projectCtrl,
-			Ready:         true,
-			disabledMCP:   map[string]ServerView{},
-		},
-	}
-	app.activeTabID = "user"
-
-	if err := app.SetAutoPlan("off"); err != nil {
-		t.Fatalf("SetAutoPlan: %v", err)
-	}
-
-	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
-	if err := userCtrl.RunTurn(context.Background(), input); err != nil {
-		t.Fatal(err)
-	}
-	if err := projectCtrl.RunTurn(context.Background(), input); err != nil {
-		t.Fatal(err)
-	}
-	if len(userRunner.inputs) != 1 || strings.HasPrefix(userRunner.inputs[0], control.PlanModeMarker) {
-		t.Fatalf("user tab should use updated auto_plan=off, inputs=%q", userRunner.inputs)
-	}
-	if len(projectRunner.inputs) != 1 || strings.HasPrefix(projectRunner.inputs[0], control.PlanModeMarker) {
-		t.Fatalf("project auto_plan should be ignored, inputs=%q", projectRunner.inputs)
-	}
-}
-
-func TestSetAutoPlanEnablingClassifierRebuildsActiveController(t *testing.T) {
-	isolateDesktopUserDirs(t)
-
-	cfg := config.LoadForEdit(config.UserConfigPath())
-	cfg.Agent.AutoPlan = "off"
-	cfg.Agent.AutoPlanClassifier = "deepseek-flash"
-	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
-		t.Fatalf("save config: %v", err)
-	}
-
-	app := NewApp()
-	app.ctx = context.Background()
-	app.readyHook = func() {}
-	old := control.New(control.Options{AutoPlan: "off", Label: "old-controller"})
-	app.setTestCtrl(old, "deepseek-flash/deepseek-v4-flash")
-	defer func() {
-		if c := app.activeCtrl(); c != nil {
-			c.Close()
-		}
-	}()
-
-	if err := app.SetAutoPlan("on"); err != nil {
-		t.Fatalf("SetAutoPlan(on): %v", err)
-	}
-	if c := app.activeCtrl(); c == nil {
-		t.Fatal("SetAutoPlan should leave a rebuilt controller")
-	}
-	if c := app.activeCtrl(); c == old {
-		t.Fatal("SetAutoPlan should rebuild when enabling a configured classifier")
-	}
-
 	got := config.LoadForEdit(config.UserConfigPath())
-	if got.Agent.AutoPlan != "on" {
-		t.Fatalf("saved auto_plan = %q, want on", got.Agent.AutoPlan)
+	if got.Agent.AutoPlan != "off" || got.Agent.AutoPlanClassifier != "" {
+		t.Fatalf("retired auto-plan state = (%q, %q), want off/empty", got.Agent.AutoPlan, got.Agent.AutoPlanClassifier)
 	}
 }
 
@@ -1030,6 +926,46 @@ func TestSetDesktopCheckUpdatesPersistsToUserConfig(t *testing.T) {
 	}
 	if cfg.DesktopCheckUpdates() {
 		t.Fatal("DesktopCheckUpdates() = true, want false")
+	}
+}
+
+func TestSetDesktopConversationWidthPersistsToUserConfig(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	if got := app.Settings().ConversationWidth; got != "standard" {
+		t.Fatalf("Settings().ConversationWidth default = %q, want standard", got)
+	}
+	if got := app.DesktopStartupSettings().ConversationWidth; got != "standard" {
+		t.Fatalf("DesktopStartupSettings().ConversationWidth default = %q, want standard", got)
+	}
+	if err := app.SetDesktopConversationWidth("full"); err != nil {
+		t.Fatalf("SetDesktopConversationWidth: %v", err)
+	}
+	if got := app.Settings().ConversationWidth; got != "full" {
+		t.Fatalf("Settings().ConversationWidth = %q, want full", got)
+	}
+	if got := app.DesktopStartupSettings().ConversationWidth; got != "full" {
+		t.Fatalf("DesktopStartupSettings().ConversationWidth = %q, want full", got)
+	}
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if got := cfg.DesktopConversationWidth(); got != "full" {
+		t.Fatalf("persisted conversation width = %q, want full", got)
+	}
+
+	if err := app.SetDesktopConversationWidth("wide"); err == nil {
+		t.Fatal("SetDesktopConversationWidth(wide) unexpectedly succeeded")
+	}
+	if got := config.LoadForEdit(config.UserConfigPath()).DesktopConversationWidth(); got != "full" {
+		t.Fatalf("invalid update changed persisted conversation width to %q", got)
+	}
+
+	raw, err := json.Marshal(app.DesktopStartupSettings())
+	if err != nil {
+		t.Fatalf("marshal DesktopStartupSettings: %v", err)
+	}
+	if !strings.Contains(string(raw), `"conversationWidth":"full"`) {
+		t.Fatalf("startup bridge payload omitted conversationWidth: %s", raw)
 	}
 }
 
@@ -1076,51 +1012,6 @@ func TestSetDesktopMetricsDefaultsOnAndPersistsOff(t *testing.T) {
 	}
 	if cfg.DesktopMetrics() {
 		t.Fatal("DesktopMetrics() = true, want false")
-	}
-}
-
-func TestSetMemoryCompilerDefaultsOnAndPersistsOff(t *testing.T) {
-	isolateDesktopUserDirs(t)
-
-	app := NewApp()
-	if !app.Settings().MemoryCompiler {
-		t.Fatal("Settings().MemoryCompiler default = false, want true")
-	}
-	if err := app.SetMemoryCompilerEnabled(false); err != nil {
-		t.Fatalf("SetMemoryCompilerEnabled: %v", err)
-	}
-	view := app.Settings()
-	if view.MemoryCompiler {
-		t.Fatal("Settings().MemoryCompiler = true, want false")
-	}
-	cfg := config.LoadForEdit(config.UserConfigPath())
-	if cfg.Agent.MemoryCompiler.Enabled == nil || *cfg.Agent.MemoryCompiler.Enabled {
-		t.Fatalf("agent.memory_compiler.enabled = %+v, want false", cfg.Agent.MemoryCompiler.Enabled)
-	}
-	if cfg.MemoryCompilerEnabled() {
-		t.Fatal("MemoryCompilerEnabled() = true, want false")
-	}
-}
-
-type memoryCompilerTargetFake struct {
-	calls []bool
-}
-
-func (f *memoryCompilerTargetFake) SetMemoryCompilerEnabled(enabled bool) {
-	f.calls = append(f.calls, enabled)
-}
-
-func TestApplyMemoryCompilerToControllersBroadcastsToAllTargets(t *testing.T) {
-	first := &memoryCompilerTargetFake{}
-	second := &memoryCompilerTargetFake{}
-
-	applyMemoryCompilerToControllers(false, []memoryCompilerTarget{first, nil, second})
-
-	if !reflect.DeepEqual(first.calls, []bool{false}) {
-		t.Fatalf("first calls = %v, want [false]", first.calls)
-	}
-	if !reflect.DeepEqual(second.calls, []bool{false}) {
-		t.Fatalf("second calls = %v, want [false]", second.calls)
 	}
 }
 
@@ -1433,6 +1324,50 @@ func TestLoadDesktopUserConfigViewKeepsLegacyBotConfigMigrationInMemory(t *testi
 	}
 	if string(rawLegacy) != legacyBody {
 		t.Fatalf("migration must not rewrite the legacy config, got:\n%s", rawLegacy)
+	}
+}
+
+func TestLoadDesktopUserConfigForRootDoesNotFollowActiveTab(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	userPath := config.UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte("default_model = \"local/m1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	targetRoot := t.TempDir()
+	activeRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(targetRoot, "reasonix.toml"), []byte("[bot]\nenabled = true\nmodel = \"target\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(activeRoot, "reasonix.toml"), []byte("[bot]\nenabled = true\nmodel = \"active\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	app.tabs = map[string]*WorkspaceTab{
+		"active": {ID: "active", Scope: "project", WorkspaceRoot: activeRoot, Ready: true},
+	}
+	app.activeTabID = "active"
+
+	cfg, _, err := app.loadDesktopUserConfigForViewForRoot(targetRoot)
+	if err != nil {
+		t.Fatalf("loadDesktopUserConfigForViewForRoot: %v", err)
+	}
+	if !cfg.Bot.Enabled || cfg.Bot.Model != "target" {
+		t.Fatalf("root-specific view followed active tab: bot = %+v", cfg.Bot)
+	}
+
+	unlock := config.LockUserConfigEdits()
+	_, _, err = app.loadDesktopUserConfigForEditForRoot(targetRoot)
+	unlock()
+	if err != nil {
+		t.Fatalf("loadDesktopUserConfigForEditForRoot: %v", err)
+	}
+	migrated := config.LoadForEditWithoutCredentials(userPath)
+	if !migrated.Bot.Enabled || migrated.Bot.Model != "target" {
+		t.Fatalf("root-specific edit migrated the active tab instead: bot = %+v", migrated.Bot)
 	}
 }
 

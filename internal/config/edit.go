@@ -69,19 +69,16 @@ func (c *Config) SetPlannerModel(name string) error {
 	return nil
 }
 
-// SetAutoPlan sets the interactive auto-plan gate. "off" keeps plan mode manual;
-// "on" opts into the automatic plan-first workflow for complex-looking turns.
-// "ask" is accepted as a legacy synonym for "on" but is never written back.
+// SetAutoPlan is retained for source compatibility with older desktop clients.
+// Automatic plan mode is retired: "off" is an idempotent compatibility write,
+// while every attempt to enable it is rejected explicitly.
 func (c *Config) SetAutoPlan(mode string) error {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "off":
+	if strings.EqualFold(strings.TrimSpace(mode), "off") {
 		c.Agent.AutoPlan = "off"
-	case "on", "ask":
-		c.Agent.AutoPlan = "on"
-	default:
-		return fmt.Errorf("auto_plan %q: must be off|on", mode)
+		c.Agent.AutoPlanClassifier = ""
+		return nil
 	}
-	return nil
+	return fmt.Errorf("automatic plan mode has been retired; use Plan Mode explicitly")
 }
 
 // SetDesktopDefaultToolApprovalMode sets the Ask/Auto/YOLO posture used only
@@ -97,27 +94,6 @@ func (c *Config) SetDesktopDefaultToolApprovalMode(mode string) error {
 	default:
 		return fmt.Errorf("default_tool_approval_mode %q: must be ask|auto|yolo", mode)
 	}
-	return nil
-}
-
-// SetMemoryCompilerEnabled toggles the v5 execution-memory compiler.
-func (c *Config) SetMemoryCompilerEnabled(enabled bool) error {
-	c.Agent.MemoryCompiler.Enabled = &enabled
-	return nil
-}
-
-// SetMemoryCompilerVerbosity controls whether Memory v5 only observes turns or
-// also injects compact execution contracts into provider-visible messages.
-func (c *Config) SetMemoryCompilerVerbosity(verbosity string) error {
-	normalized := NormalizeMemoryCompilerVerbosity(verbosity)
-	if strings.TrimSpace(verbosity) != "" && normalized == MemoryCompilerVerbosityObserve {
-		switch strings.ToLower(strings.TrimSpace(verbosity)) {
-		case "observe", "observed", "silent", "minimal", "none":
-		default:
-			return fmt.Errorf("memory_compiler.verbosity %q: must be observe|compact", verbosity)
-		}
-	}
-	c.Agent.MemoryCompiler.Verbosity = normalized
 	return nil
 }
 
@@ -386,6 +362,21 @@ func (c *Config) SetDesktopTelemetry(enabled bool) error {
 // SetDesktopMetrics sets whether the desktop sends aggregate desktop metrics.
 func (c *Config) SetDesktopMetrics(enabled bool) error {
 	c.Desktop.Metrics = &enabled
+	return nil
+}
+
+// SetDesktopConversationWidth sets the max transcript width preference.
+// standard = 960px fixed; full = 90% of the parent, with a 960px floor.
+// An empty value resets to standard.
+func (c *Config) SetDesktopConversationWidth(width string) error {
+	switch strings.ToLower(strings.TrimSpace(width)) {
+	case "", "standard":
+		c.Desktop.ConversationWidth = "standard"
+	case "full":
+		c.Desktop.ConversationWidth = "full"
+	default:
+		return fmt.Errorf("conversation width %q: must be standard|full", width)
+	}
 	return nil
 }
 
@@ -809,7 +800,15 @@ func (c *Config) ClearPluginAuthentication(name string) (PluginEntry, bool, erro
 // user config. Source priority mirrors Load(): project TOML, user TOML, then the
 // project .mcp.json entry if TOML did not define that server.
 func ClearPluginAuthenticationInSource(name string) (PluginEntry, bool, string, error) {
-	if path := pluginTOMLSourcePath(name); path != "" {
+	return ClearPluginAuthenticationInSourceForRoot(".", name)
+}
+
+// ClearPluginAuthenticationInSourceForRoot clears auth material in the source
+// that owns name for the supplied workspace. The root is explicit so a desktop
+// action cannot drift to another project's reasonix.toml or .mcp.json after the
+// user switches tabs while the action is waiting on a lifecycle lock.
+func ClearPluginAuthenticationInSourceForRoot(root, name string) (PluginEntry, bool, string, error) {
+	if path := pluginTOMLSourcePathForRoot(root, name); path != "" {
 		cfg := LoadForEdit(path)
 		updated, changed, err := cfg.ClearPluginAuthentication(name)
 		if err != nil {
@@ -822,15 +821,15 @@ func ClearPluginAuthenticationInSource(name string) (PluginEntry, bool, string, 
 		}
 		return updated, changed, path, nil
 	}
-	updated, changed, err := clearMCPJSONAuthentication(mcpJSONFile, name)
+	mcpPath := mcpJSONFile
+	if resolved := resolveRoot(root); resolved != "." {
+		mcpPath = filepath.Join(resolved, mcpJSONFile)
+	}
+	updated, changed, err := clearMCPJSONAuthentication(mcpPath, name)
 	if err != nil {
 		return PluginEntry{}, false, "", err
 	}
-	return updated, changed, mcpJSONFile, nil
-}
-
-func pluginTOMLSourcePath(name string) string {
-	return pluginTOMLSourcePathForRoot(".", name)
+	return updated, changed, mcpPath, nil
 }
 
 func pluginTOMLSourcePathForRoot(root, name string) string {

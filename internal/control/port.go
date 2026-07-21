@@ -102,17 +102,16 @@ type Goals interface {
 	AutoResearchList() ([]autoresearch.Summary, bool)
 	AutoResearchFindings(limit int) ([]autoresearch.Finding, bool)
 	RecordAutoResearchEvidence(criterionID string, input AutoResearchEvidenceInput) error
-	AutoStartResearchGoal(input string) (string, bool)
 	ResetPlannerSession()
 	PlanMode() bool
 	SetPlanMode(v bool)
-	SetAutoPlan(mode string)
 }
 
 // SessionHistory covers checkpoint/rewind, branch/fork, and the log-restructuring
 // operations (compact, summarize).
 type SessionHistory interface {
 	Checkpoints() []checkpoint.Meta
+	CheckpointFileState(path string) (checkpoint.FileState, bool)
 	CheckpointTurnsByMessageIndex() map[int]int
 	CheckpointHasBoundary(turn int) bool
 	Rewind(turn int, scope RewindScope) error
@@ -182,6 +181,7 @@ type Status interface {
 // state.
 type SessionPersistence interface {
 	Snapshot() error
+	SnapshotForShutdown() error
 	SnapshotActivity() error
 	SessionCache() (hit, miss int)
 	BeginDestroySession(sessionPath string) SessionDestroyHandle
@@ -205,8 +205,6 @@ type Input interface {
 type Settings interface {
 	SetResponseLanguage(lang string)
 	SetReasoningLanguage(lang string)
-	SetMemoryCompilerEnabled(enabled bool)
-	SetMemoryCompilerVerbosity(verbosity string)
 	SetDisplayRecorder(fn func(content, display string))
 }
 

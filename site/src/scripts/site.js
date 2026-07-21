@@ -1,7 +1,9 @@
 import { downloadPaneFromURL } from "./download-link.js";
+import { initTheme } from "./theme.js";
 
 // Reasonix site — vanilla interactions
 (function () {
+  initTheme();
   const motionOK = () =>
     document.body.dataset.motion === "rich" &&
     !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -113,18 +115,26 @@ import { downloadPaneFromURL } from "./download-link.js";
   /* language switch */
   const LANG_KEY = "reasonix-lang";
   const langBtns = Array.from(document.querySelectorAll(".lang-switch button"));
-  const setLang = (l) => {
+  const setLang = (l, alignHash) => {
     document.body.dataset.lang = l;
     document.documentElement.lang = l === "zh" ? "zh-CN" : "en";
     const t = document.body.dataset[l === "zh" ? "titleZh" : "titleEn"];
     if (t) document.title = t;
     langBtns.forEach((b) => b.classList.toggle("active", b.dataset.lang === l));
     try { localStorage.setItem(LANG_KEY, l); } catch (e) {}
+    if (alignHash && window.location.hash) {
+      const target = document.getElementById(window.location.hash.slice(1));
+      if (target) requestAnimationFrame(() => target.scrollIntoView({ block: "start" }));
+    }
   };
   langBtns.forEach((b) => b.addEventListener("click", () => setLang(b.dataset.lang)));
   let savedLang = "";
   try { savedLang = localStorage.getItem(LANG_KEY) || ""; } catch (e) {}
-  setLang(savedLang || ((navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en"));
+  const requestedLang = new URLSearchParams(window.location.search).get("lang");
+  const initialLang = requestedLang === "zh" || requestedLang === "en"
+    ? requestedLang
+    : savedLang || ((navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en");
+  setLang(initialLang, true);
 
   /* docs scrollspy */
   const sideLinks = Array.from(document.querySelectorAll(".docs-side a[href^='#']"));
@@ -169,9 +179,11 @@ import { downloadPaneFromURL } from "./download-link.js";
     "Reasonix-linux-amd64.deb",
     "Reasonix-linux-amd64.tar.gz",
   ];
-  fetch("https://dl.reasonix.io/latest/latest.json", { cache: "no-cache" })
-    .then((r) => (r.ok ? r.json() : null))
-    .then((d) => {
+  const localPreview = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+  if (!localPreview) {
+    fetch("https://dl.reasonix.io/latest/latest.json", { cache: "no-cache" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
       const rawVersion = String((d && d.version) || "");
       const versionMatch = rawVersion.match(/^v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/);
       if (!versionMatch) return;
@@ -184,8 +196,9 @@ import { downloadPaneFromURL } from "./download-link.js";
         });
       });
       document.querySelectorAll("a.rxnotes").forEach((a) => {
-        a.href = a.href.replace(/releases\/tag\/v[^/]*$/, "releases/tag/v" + v);
+        a.href = new URL("changelog/v" + v + "/", window.location.origin + "/").href;
       });
-    })
-    .catch(() => {});
+      })
+      .catch(() => {});
+  }
 })();
