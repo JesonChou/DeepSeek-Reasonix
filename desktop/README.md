@@ -200,8 +200,11 @@ both seams light up everywhere at once.
 `WorkspacePanel` passes `showLineNumbers` for text-file previews. The resulting
 viewer provides a line-number gutter, viewer-scoped Ctrl/Cmd+F search with case
 and whole-word options, copy support, and virtualized rendering above 100 lines.
-Workspace files are previewed up to 2 MiB; larger files display the first 2 MiB
-with a localized truncation notice.
+Search marks are applied only to visible rows so query input does not rebuild the
+entire highlighted document. Files above 512 KiB or 20,000 lines keep line
+numbers, search, copy, and virtualization but use escaped plain text instead of
+syntax highlighting. Workspace files are previewed up to 2 MiB; larger files
+display the first 2 MiB with a localized truncation notice.
 
 ## Multi-platform adaptation
 

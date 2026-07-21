@@ -5,6 +5,8 @@ export interface EditorProps {
   language?: string;
   readOnly?: boolean;
   maxHeight?: number;
+  /** Original source size in bytes when the caller already has it. */
+  sourceSize?: number;
   /** Opt in to the workspace-oriented viewer with line numbers and search. */
   showLineNumbers?: boolean;
 }
