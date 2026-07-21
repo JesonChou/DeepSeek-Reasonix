@@ -5,25 +5,19 @@ export interface EditorProps {
   language?: string;
   readOnly?: boolean;
   maxHeight?: number;
-  /** Show a line-number gutter (default true — line-numbers are shown when prop is not false). */
+  /** Opt in to the workspace-oriented viewer with line numbers and search. */
   showLineNumbers?: boolean;
 }
 
 // ── EDITOR SEAM (code) ───────────────────────────────────────────────────────
-// Every code view in the app renders through this component, so upgrading the
-// editor is a one-line change here — swap the lazily-imported module:
-//
-//   ./editors/LineNumberCode    current — highlight.js + virtual scroll + line numbers + search
-//   ./editors/HljsCode          legacy — highlight.js read-only view
-//   ./editors/MonacoCode        pnpm add @monaco-editor/react monaco-editor
-//   ./editors/CodeMirrorCode    pnpm add @uiw/react-codemirror @codemirror/lang-*
-//
-// The replacement only has to honor EditorProps. It's lazy-loaded so a heavy
-// editor (~MBs) never lands in the initial bundle — it streams in the first time
-// a code block or tool result is shown. See desktop/README.md ("Editor seam").
-const Impl = lazy(() => import("./editors/LineNumberCode"));
+// Keep the established highlighted viewer for existing chat, diff, and tool
+// surfaces. Workspace previews explicitly opt into the heavier searchable
+// viewer, so this feature cannot silently change every code block in the app.
+const HljsImpl = lazy(() => import("./editors/HljsCode"));
+const LineNumberImpl = lazy(() => import("./editors/LineNumberCode"));
 
 export function CodeViewer(props: EditorProps) {
+  const Impl = props.showLineNumbers ? LineNumberImpl : HljsImpl;
   return (
     <div className="code-block">
       <Suspense

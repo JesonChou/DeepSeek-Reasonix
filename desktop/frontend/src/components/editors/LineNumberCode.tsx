@@ -1,16 +1,180 @@
-import { useRef, useState, useMemo, useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { EditorProps } from "../CodeViewer";
 import { highlightToHtml } from "../../lib/highlight";
+import { CopyButton } from "../CopyButton";
 
-// ── Line-numbered code viewer with virtual scroll and search ──────────────
-// Renders large files smoothly by virtualising rows (>100 lines), adding a
-// line-number gutter and a Ctrl+F search bar with match navigation,
-// case-sensitivity, and whole-word toggles (Codex-style).
-
+// Line-numbered code viewer with virtual scroll and viewer-scoped search.
 const VIRTUAL_THRESHOLD = 100;
 const ROW_HEIGHT_ESTIMATE = 22;
 const OVERSCAN = 15;
+const WORD_CHARACTER_RE = /[\p{L}\p{N}_]/u;
+
+export interface CodeSearchMatch {
+  lineIndex: number;
+  start: number;
+  end: number;
+  absoluteStart: number;
+  absoluteEnd: number;
+}
+
+export function findCodeMatches(
+  value: string,
+  query: string,
+  caseSensitive = false,
+  wholeWord = false,
+): CodeSearchMatch[] {
+  if (!query) return [];
+
+  const matches: CodeSearchMatch[] = [];
+  const lines = value.split("\n");
+  const pattern = new RegExp(escapeRegex(query), caseSensitive ? "gu" : "giu");
+  let absoluteOffset = 0;
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(line)) !== null) {
+      const start = match.index;
+      const end = start + match[0].length;
+      const startsInsideWord = start > 0 && isWordCharacter(codePointBefore(line, start));
+      const endsInsideWord = end < line.length && isWordCharacter(codePointAt(line, end));
+      if (!wholeWord || (!startsInsideWord && !endsInsideWord)) {
+        matches.push({
+          lineIndex,
+          start,
+          end,
+          absoluteStart: absoluteOffset + start,
+          absoluteEnd: absoluteOffset + end,
+        });
+      }
+      // The query is non-empty, but keep the loop safe if regex behavior ever
+      // changes around an unusual Unicode sequence.
+      if (match[0].length === 0) pattern.lastIndex += 1;
+    }
+    absoluteOffset += line.length + 1;
+  }
+
+  return matches;
+}
+
+// Insert mark elements by source offset rather than replacing serialized HTML
+// text. highlight.js escapes &, <, >, and quotes, so direct replacement can
+// either miss the source character or split an entity such as &amp;.
+export function highlightCodeMatches(
+  highlightedHtml: string,
+  matches: CodeSearchMatch[],
+  currentMatchIndex: number,
+): string {
+  if (matches.length === 0) return highlightedHtml;
+
+  let htmlOffset = 0;
+  let sourceOffset = 0;
+  let matchIndex = 0;
+  let markOpen = false;
+  let result = "";
+
+  const openMark = () => (
+    matchIndex === currentMatchIndex
+      ? '<mark class="code-search-hl code-search-hl--current">'
+      : '<mark class="code-search-hl">'
+  );
+
+  while (htmlOffset < highlightedHtml.length) {
+    const char = highlightedHtml[htmlOffset];
+    if (char === "<") {
+      const tagEnd = highlightedHtml.indexOf(">", htmlOffset);
+      if (tagEnd === -1) {
+        result += highlightedHtml.slice(htmlOffset);
+        break;
+      }
+      const tag = highlightedHtml.slice(htmlOffset, tagEnd + 1);
+      if (markOpen) result += "</mark>";
+      result += tag;
+      if (markOpen) result += openMark();
+      htmlOffset = tagEnd + 1;
+      continue;
+    }
+
+    if (!markOpen && matches[matchIndex]?.absoluteStart === sourceOffset) {
+      markOpen = true;
+      result += openMark();
+    }
+
+    let token: string;
+    let sourceLength: number;
+    if (char === "&") {
+      const entityEnd = highlightedHtml.indexOf(";", htmlOffset);
+      if (entityEnd !== -1) {
+        token = highlightedHtml.slice(htmlOffset, entityEnd + 1);
+        sourceLength = decodedEntityLength(token);
+      } else {
+        token = char;
+        sourceLength = 1;
+      }
+    } else {
+      const codePoint = highlightedHtml.codePointAt(htmlOffset) ?? 0;
+      sourceLength = codePoint > 0xffff ? 2 : 1;
+      token = highlightedHtml.slice(htmlOffset, htmlOffset + sourceLength);
+    }
+
+    result += token;
+    htmlOffset += token.length;
+    sourceOffset += sourceLength;
+
+    if (markOpen && matches[matchIndex]?.absoluteEnd === sourceOffset) {
+      result += "</mark>";
+      markOpen = false;
+      matchIndex += 1;
+    }
+  }
+
+  if (markOpen) result += "</mark>";
+  return result;
+}
+
+// A multiline highlight.js span may cross a newline. Each virtual row needs
+// valid standalone HTML, so close active tags at the boundary and reopen the
+// same stack on the next line.
+export function splitHighlightedCodeLines(html: string): string[] {
+  const lines: string[] = [];
+  const openTags: string[] = [];
+  let current = "";
+  let offset = 0;
+
+  while (offset < html.length) {
+    if (html[offset] === "\n") {
+      current += closeTags(openTags);
+      lines.push(current);
+      current = openTags.join("");
+      offset += 1;
+      continue;
+    }
+    if (html[offset] === "<") {
+      const tagEnd = html.indexOf(">", offset);
+      if (tagEnd !== -1) {
+        const tag = html.slice(offset, tagEnd + 1);
+        current += tag;
+        if (/^<(span|mark)\b/.test(tag)) {
+          openTags.push(tag);
+        } else if (/^<\/(span|mark)>$/.test(tag)) {
+          openTags.pop();
+        }
+        offset = tagEnd + 1;
+        continue;
+      }
+    }
+    const codePoint = html.codePointAt(offset) ?? 0;
+    const length = codePoint > 0xffff ? 2 : 1;
+    current += html.slice(offset, offset + length);
+    offset += length;
+  }
+
+  current += closeTags(openTags);
+  lines.push(current);
+  return lines;
+}
 
 export default function LineNumberCode({
   value,
@@ -19,12 +183,8 @@ export default function LineNumberCode({
   maxHeight,
 }: EditorProps) {
   const lines = useMemo(() => value.split("\n"), [value]);
-  const baseHtmls = useMemo(
-    () => lines.map((line) => highlightToHtml(line, language)),
-    [lines, language],
-  );
+  const highlightedHtml = useMemo(() => highlightToHtml(value, language), [value, language]);
 
-  // ── search state ────────────────────────────────────────────────────────
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -32,70 +192,29 @@ export default function LineNumberCode({
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const sortedMatches = useMemo(() => {
-    if (!query) return [] as number[];
-    const wordRe = wholeWord
-      ? new RegExp(`\\b${escapeRegex(query)}\\b`, caseSensitive ? "g" : "gi")
-      : new RegExp(escapeRegex(query), caseSensitive ? "g" : "gi");
-    const matches: number[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (wordRe.test(lines[i])) matches.push(i);
-    }
-    return matches;
-  }, [lines, query, caseSensitive, wholeWord]);
+  const matches = useMemo(
+    () => findCodeMatches(value, query, caseSensitive, wholeWord),
+    [value, query, caseSensitive, wholeWord],
+  );
+  const totalMatches = matches.length;
+  const activeMatchIndex = totalMatches > 0 ? currentMatchIdx % totalMatches : 0;
+  const matchingLines = useMemo(
+    () => new Set(matches.map((match) => match.lineIndex)),
+    [matches],
+  );
+  const lineHtmls = useMemo(
+    () => splitHighlightedCodeLines(
+      highlightCodeMatches(highlightedHtml, matches, activeMatchIndex),
+    ),
+    [highlightedHtml, matches, activeMatchIndex],
+  );
 
-  // Inline highlight: wrap matched text in <mark> tags inside the already-
-  // syntax-highlighted HTML, splitting on tags so we never corrupt them.
-  const lineHtmls = useMemo(() => {
-    if (!query) return baseHtmls;
-    const re = new RegExp(
-      wholeWord ? `\\b${escapeRegex(query)}\\b` : escapeRegex(query),
-      caseSensitive ? "g" : "gi",
-    );
-    return baseHtmls.map((html, i) => {
-      if (!sortedMatches.includes(i)) return html;
-      // Split on HTML tags: text segments (even indices) get <mark> treatment.
-      const parts = html.split(/(<[^>]*>)/g);
-      return parts
-        .map((seg, j) => {
-          if (j % 2 === 1) return seg; // HTML tag — leave untouched
-          return seg.replace(
-            re,
-            '<mark class="code-search-hl">$&</mark>',
-          );
-        })
-        .join("");
-    });
-  }, [baseHtmls, query, caseSensitive, wholeWord, sortedMatches]);
-
-  const totalMatches = sortedMatches.length;
-
-  // Reset current match when query or toggles change.
   useEffect(() => {
     setCurrentMatchIdx(0);
   }, [query, caseSensitive, wholeWord]);
 
-  // Ctrl+F / Cmd+F → open search
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "f") {
-        e.preventDefault();
-        setSearchOpen(true);
-        setTimeout(() => inputRef.current?.focus(), 0);
-      }
-      if (e.key === "Escape" && searchOpen) {
-        setSearchOpen(false);
-        setQuery("");
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [searchOpen]);
-
-  // ── virtual scroll ──────────────────────────────────────────────────────
   const scrollRef = useRef<HTMLDivElement>(null);
   const isVirtual = showLineNumbers !== false && lines.length > VIRTUAL_THRESHOLD;
-
   const virtualizer = useVirtualizer({
     count: isVirtual ? lines.length : 0,
     getScrollElement: () => scrollRef.current,
@@ -103,7 +222,6 @@ export default function LineNumberCode({
     overscan: OVERSCAN,
   });
 
-  // Scroll so the line at `index` is centred in the viewport.
   const scrollToLine = useCallback(
     (index: number) => {
       if (!scrollRef.current) return;
@@ -111,7 +229,7 @@ export default function LineNumberCode({
         virtualizer.scrollToIndex(index, { align: "center" });
       } else {
         scrollRef.current.scrollTo({
-          top: index * ROW_HEIGHT_ESTIMATE - (scrollRef.current.clientHeight ?? 300) / 2,
+          top: index * ROW_HEIGHT_ESTIMATE - scrollRef.current.clientHeight / 2,
           behavior: "smooth",
         });
       }
@@ -119,30 +237,27 @@ export default function LineNumberCode({
     [isVirtual, virtualizer],
   );
 
-  // Jump to next / previous match
   const jumpToMatch = useCallback(
-    (dir: 1 | -1) => {
+    (direction: 1 | -1) => {
       if (totalMatches === 0) return;
-      const nextIdx =
-        dir === 1
-          ? (currentMatchIdx + 1) % totalMatches
-          : (currentMatchIdx - 1 + totalMatches) % totalMatches;
-      setCurrentMatchIdx(nextIdx);
-      const lineIdx = sortedMatches[nextIdx];
-      if (lineIdx !== undefined) scrollToLine(lineIdx);
+      const nextIndex = direction === 1
+        ? (activeMatchIndex + 1) % totalMatches
+        : (activeMatchIndex - 1 + totalMatches) % totalMatches;
+      setCurrentMatchIdx(nextIndex);
+      const lineIndex = matches[nextIndex]?.lineIndex;
+      if (lineIndex != null) scrollToLine(lineIndex);
     },
-    [currentMatchIdx, totalMatches, sortedMatches, scrollToLine],
+    [activeMatchIndex, matches, scrollToLine, totalMatches],
   );
 
   const lineNoWidth = String(lines.length).length;
-
-  const renderRow = (i: number) => {
-    const lineNo = i + 1;
-    const isCurrent = query && sortedMatches[currentMatchIdx] === i;
-    const isDimmed = query && !sortedMatches.includes(i);
+  const renderRow = (index: number) => {
+    const lineNo = index + 1;
+    const isCurrent = query && matches[activeMatchIndex]?.lineIndex === index;
+    const isDimmed = query && !matchingLines.has(index);
     return (
       <div
-        key={i}
+        key={index}
         className={`code-line-row${isCurrent ? " code-line-row--current" : ""}${isDimmed ? " code-line-row--dim" : ""}`}
       >
         {showLineNumbers !== false && (
@@ -156,7 +271,7 @@ export default function LineNumberCode({
         )}
         <code
           className="code-line-text"
-          dangerouslySetInnerHTML={{ __html: lineHtmls[i] || " " }}
+          dangerouslySetInnerHTML={{ __html: lineHtmls[index] || " " }}
         />
       </div>
     );
@@ -164,7 +279,6 @@ export default function LineNumberCode({
 
   return (
     <div className="code-block__wrap">
-      {/* search bar — Codex-style: input + "N of M" + nav arrows + toggles + close */}
       {searchOpen && (
         <div className="code-search">
           <input
@@ -173,13 +287,12 @@ export default function LineNumberCode({
             className="code-search__input"
             placeholder="Find"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                jumpToMatch(e.shiftKey ? -1 : 1);
-              }
-              if (e.key === "Escape") {
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                jumpToMatch(event.shiftKey ? -1 : 1);
+              } else if (event.key === "Escape") {
                 setSearchOpen(false);
                 setQuery("");
               }
@@ -188,7 +301,7 @@ export default function LineNumberCode({
 
           {query && (
             <span className="code-search__count">
-              {totalMatches > 0 ? currentMatchIdx + 1 : 0} of {totalMatches}
+              {totalMatches > 0 ? activeMatchIndex + 1 : 0} of {totalMatches}
             </span>
           )}
 
@@ -199,6 +312,7 @@ export default function LineNumberCode({
                 onClick={() => jumpToMatch(-1)}
                 aria-label="Previous match"
                 title="Previous match"
+                type="button"
               >
                 <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2L2 6l4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
               </button>
@@ -207,6 +321,7 @@ export default function LineNumberCode({
                 onClick={() => jumpToMatch(1)}
                 aria-label="Next match"
                 title="Next match"
+                type="button"
               >
                 <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
               </button>
@@ -215,35 +330,52 @@ export default function LineNumberCode({
 
           <button
             className={`code-search__toggle${caseSensitive ? " code-search__toggle--on" : ""}`}
-            onClick={() => setCaseSensitive((v) => !v)}
+            onClick={() => setCaseSensitive((enabled) => !enabled)}
             aria-label="Match case"
             title="Match case"
+            type="button"
           >
             Aa
           </button>
           <button
             className={`code-search__toggle${wholeWord ? " code-search__toggle--on" : ""}`}
-            onClick={() => setWholeWord((v) => !v)}
+            onClick={() => setWholeWord((enabled) => !enabled)}
             aria-label="Match whole word"
             title="Match whole word"
+            type="button"
           >
             ab
           </button>
-
           <button
             className="code-search__close"
-            onClick={() => { setSearchOpen(false); setQuery(""); }}
+            onClick={() => {
+              setSearchOpen(false);
+              setQuery("");
+            }}
             aria-label="Close search"
+            type="button"
           >
             ✕
           </button>
         </div>
       )}
 
-      {/* code area */}
       <div
         ref={scrollRef}
         className="code hljs code--lines"
+        data-lang={language}
+        tabIndex={0}
+        onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+            event.preventDefault();
+            event.stopPropagation();
+            setSearchOpen(true);
+            window.setTimeout(() => inputRef.current?.focus(), 0);
+          } else if (event.key === "Escape" && searchOpen) {
+            setSearchOpen(false);
+            setQuery("");
+          }
+        }}
         style={{
           maxHeight: maxHeight ?? undefined,
           overflow: maxHeight != null || isVirtual ? "auto" : undefined,
@@ -273,15 +405,48 @@ export default function LineNumberCode({
           </div>
         ) : (
           <div className="code-lines-wrap">
-            {lines.map((_, i) => renderRow(i))}
+            {lines.map((_, index) => renderRow(index))}
           </div>
         )}
       </div>
+      <CopyButton text={value} className="code-block__copy" />
     </div>
   );
 }
 
-/** Escape special regex characters in user input. */
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isWordCharacter(value: string): boolean {
+  return value !== "" && WORD_CHARACTER_RE.test(value);
+}
+
+function codePointBefore(value: string, offset: number): string {
+  const codePoints = Array.from(value.slice(0, offset));
+  return codePoints[codePoints.length - 1] ?? "";
+}
+
+function codePointAt(value: string, offset: number): string {
+  return Array.from(value.slice(offset))[0] ?? "";
+}
+
+function decodedEntityLength(entity: string): number {
+  const body = entity.slice(1, -1).toLowerCase();
+  if (["amp", "lt", "gt", "quot", "apos", "#39", "#x27"].includes(body)) return 1;
+  const numeric = body.startsWith("#x")
+    ? Number.parseInt(body.slice(2), 16)
+    : body.startsWith("#")
+      ? Number.parseInt(body.slice(1), 10)
+      : Number.NaN;
+  return Number.isFinite(numeric) && numeric >= 0 && numeric <= 0x10ffff
+    ? String.fromCodePoint(numeric).length
+    : entity.length;
+}
+
+function closeTags(openTags: string[]): string {
+  return [...openTags]
+    .reverse()
+    .map((tag) => tag.startsWith("<mark") ? "</mark>" : "</span>")
+    .join("");
 }

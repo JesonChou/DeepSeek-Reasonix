@@ -4731,6 +4731,12 @@ a[href] {
 .code--lines {
   padding: 0;
 }
+.code--lines:focus {
+  outline: none;
+}
+.code--lines:focus-visible {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 48%, transparent);
+}
 .code-lines-wrap {
   font-family: var(--font-mono);
   font-size: var(--font-code);
@@ -4741,9 +4747,6 @@ a[href] {
   display: flex;
   align-items: flex-start;
   min-height: calc(1em * 1.55);
-}
-.code-line-row--match {
-  background: rgba(255, 193, 7, 0.1);
 }
 .code-line-row--dim {
   opacity: 0.35;
@@ -4769,7 +4772,6 @@ a[href] {
   padding: 0 13px;
   white-space: pre;
   line-height: inherit;
-  overflow-x: auto;
 }
 
 /* ── search bar (Ctrl+F) ───────────────────────────────────────────────── */
@@ -4777,7 +4779,7 @@ a[href] {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 10px;
+  padding: 5px 44px 5px 10px;
   background: var(--bg-elev-1);
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-sans);
@@ -4863,6 +4865,9 @@ a[href] {
   background: rgba(255, 193, 7, 0.45);
   color: inherit;
   border-radius: 2px;
+}
+.code-search-hl--current {
+  background: rgba(255, 193, 7, 0.72);
 }
 
 /* ── Mermaid diagram renderer ───────────────────────────────────────────── */
