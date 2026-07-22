@@ -94,6 +94,8 @@ func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
 	cmd.Env = env
 	if s.Dir != "" {
 		cmd.Dir = s.Dir // pin cwd-aware servers (e.g. CodeGraph) to the project root
+	} else if s.WorkspaceRoot != "" {
+		cmd.Dir = s.WorkspaceRoot // resolve relative config paths against the project root
 	}
 	stderr := &tailBuffer{limit: 16 * 1024}
 	cmd.Stderr = stderr
