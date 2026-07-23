@@ -1,3 +1,5 @@
+import { pathToLang } from "./lang";
+
 export interface SelectedTextReference {
   id: string;
   text: string;
@@ -163,85 +165,7 @@ function fenceFor(text: string): string {
 }
 
 export function languageFor(path: string): string | undefined {
-  const name = (path.split("/").filter(Boolean).pop() ?? "").toLowerCase();
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : name;
-  const byExt: Record<string, string> = {
-    c: "c",
-    cc: "cpp",
-    clj: "clojure",
-    cljc: "clojure",
-    cljs: "clojure",
-    cmake: "cmake",
-    coffee: "coffeescript",
-    cpp: "cpp",
-    cs: "csharp",
-    css: "css",
-    cxx: "cpp",
-    dart: "dart",
-    dockerfile: "dockerfile",
-    erl: "erlang",
-    ex: "elixir",
-    exs: "elixir",
-    fs: "fsharp",
-    fsx: "fsharp",
-    go: "go",
-    gradle: "gradle",
-    graphql: "graphql",
-    groovy: "groovy",
-    gql: "graphql",
-    gvy: "groovy",
-    h: "c",
-    hpp: "cpp",
-    hrl: "erlang",
-    hs: "haskell",
-    htaccess: "apache",
-    html: "xml",
-    java: "java",
-    jl: "julia",
-    js: "javascript",
-    json: "json",
-    jsx: "javascript",
-    kt: "kotlin",
-    kts: "kotlin",
-    less: "less",
-    lhs: "haskell",
-    ltx: "latex",
-    lua: "lua",
-    m: "objectivec",
-    makefile: "makefile",
-    matlab: "matlab",
-    md: "markdown",
-    mm: "objectivec",
-    nginx: "nginx",
-    perl: "perl",
-    php: "php",
-    pl: "perl",
-    pm: "perl",
-    properties: "properties",
-    proto: "protobuf",
-    ps1: "powershell",
-    psd1: "powershell",
-    psm1: "powershell",
-    py: "python",
-    r: "r",
-    rb: "ruby",
-    rs: "rust",
-    scala: "scala",
-    scss: "scss",
-    sh: "bash",
-    sql: "sql",
-    swift: "swift",
-    tex: "latex",
-    toml: "ini",
-    ts: "typescript",
-    tsx: "typescript",
-    vb: "vbnet",
-    vim: "vim",
-    xaml: "xml",
-    yaml: "yaml",
-    yml: "yaml",
-  };
-  return byExt[ext];
+  return pathToLang(path) || undefined;
 }
 
 export function formatSelectionReference(path: string, text: string): string {

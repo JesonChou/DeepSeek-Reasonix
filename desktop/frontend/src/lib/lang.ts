@@ -100,13 +100,17 @@ export const ALIASES: Record<string, string> = {
   matlab: "matlab",
 };
 
-const EXT: Record<string, string> = {
+// Keep these values as semantic fence tags rather than highlight.js lexer names.
+// UI consumers pass them through resolveLang(), while plain-text consumers (such
+// as plan revisions) preserve useful distinctions like TSX vs TypeScript and
+// XAML vs XML for the model.
+export const FILE_LANGUAGE_BY_EXTENSION: Readonly<Record<string, string>> = {
   // JavaScript
   go: "go",
   ts: "typescript",
-  tsx: "typescript",
+  tsx: "tsx",
   js: "javascript",
-  jsx: "javascript",
+  jsx: "jsx",
   mjs: "javascript",
   cjs: "javascript",
   coffee: "coffeescript",
@@ -115,8 +119,8 @@ const EXT: Record<string, string> = {
   yaml: "yaml",
   yml: "yaml",
   xml: "xml",
-  xaml: "xml",
-  html: "xml",
+  xaml: "xaml",
+  html: "html",
   // Shell
   sh: "bash",
   bash: "bash",
@@ -196,7 +200,7 @@ const EXT: Record<string, string> = {
   proto: "protobuf",
   graphql: "graphql",
   gql: "graphql",
-  toml: "ini",
+  toml: "toml",
   makefile: "makefile",
   cmake: "cmake",
   // Document
@@ -207,9 +211,33 @@ const EXT: Record<string, string> = {
   vim: "vim",
 };
 
-// extToLang infers a language name from a file path's extension (for tool diffs).
-export function extToLang(path: string): string {
-  const dot = path.lastIndexOf(".");
+export const FILE_LANGUAGE_BY_NAME: Readonly<Record<string, string>> = {
+  ".htaccess": "apache",
+  "cmakelists.txt": "cmake",
+  containerfile: "dockerfile",
+  dockerfile: "dockerfile",
+  "httpd.conf": "apache",
+  gnumakefile: "makefile",
+  makefile: "makefile",
+  "nginx.conf": "nginx",
+};
+
+// pathToLang infers a semantic language tag from either a special basename or
+// a file extension. Matching both slash styles keeps desktop previews and tool
+// diffs consistent when a Windows path reaches the frontend.
+export function pathToLang(path: string): string {
+  const name = path.split(/[\\/]/).filter(Boolean).pop()?.toLowerCase() ?? "";
+  if (!name) return "";
+
+  const exact = FILE_LANGUAGE_BY_NAME[name];
+  if (exact) return exact;
+  if (/^(?:dockerfile|containerfile)\./.test(name)) return "dockerfile";
+  if (/^(?:gnu)?makefile\./.test(name)) return "makefile";
+
+  const dot = name.lastIndexOf(".");
   if (dot < 0) return "";
-  return EXT[path.slice(dot + 1).toLowerCase()] ?? "";
+  return FILE_LANGUAGE_BY_EXTENSION[name.slice(dot + 1)] ?? "";
 }
+
+// Backward-compatible name for the existing tool-diff callers.
+export const extToLang = pathToLang;
