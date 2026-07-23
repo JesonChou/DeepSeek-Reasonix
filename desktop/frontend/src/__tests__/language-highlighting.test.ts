@@ -37,7 +37,9 @@ const pathCases = [
   ["build/GNUmakefile.release", "makefile", "makefile"],
   ["CMakeLists.txt", "cmake", "cmake"],
   ["public/.htaccess", "apache", "apache"],
+  ["config/httpd.conf", "apache", "apache"],
   ["config/nginx.conf", "nginx", "nginx"],
+  ["build/module.makefile", "makefile", "makefile"],
 ] as const;
 
 for (const [path, semantic, lexer] of pathCases) {
