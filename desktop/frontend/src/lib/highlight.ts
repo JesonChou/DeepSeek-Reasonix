@@ -116,6 +116,57 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
 }
 
+export const MAX_HIGHLIGHT_BYTES = 512 * 1024;
+export const MAX_HIGHLIGHT_LINES = 20_000;
+
+export function shouldHighlightCode(sourceSize: number, lineCount: number): boolean {
+  return sourceSize <= MAX_HIGHLIGHT_BYTES && lineCount <= MAX_HIGHLIGHT_LINES;
+}
+
+// Apply one shared syntax-highlighting budget to chat blocks, tool output, and
+// workspace previews. Callers with an authoritative byte size or an existing
+// line split can pass those values to avoid duplicate work; ordinary chat
+// blocks are measured here without allocating another copy of the source.
+export function shouldHighlightSource(
+  source: string,
+  sourceSize?: number,
+  lineCount?: number,
+): boolean {
+  if (sourceSize != null && sourceSize > MAX_HIGHLIGHT_BYTES) return false;
+  if (lineCount != null && lineCount > MAX_HIGHLIGHT_LINES) return false;
+  if (sourceSize != null && lineCount != null) return true;
+
+  let measuredBytes = sourceSize ?? 0;
+  let measuredLines = lineCount ?? 1;
+  for (let i = 0; i < source.length; i += 1) {
+    const codeUnit = source.charCodeAt(i);
+    if (lineCount == null && codeUnit === 10) {
+      measuredLines += 1;
+      if (measuredLines > MAX_HIGHLIGHT_LINES) return false;
+    }
+    if (sourceSize != null) continue;
+
+    if (codeUnit < 0x80) {
+      measuredBytes += 1;
+    } else if (codeUnit < 0x800) {
+      measuredBytes += 2;
+    } else if (
+      codeUnit >= 0xd800
+      && codeUnit <= 0xdbff
+      && i + 1 < source.length
+      && source.charCodeAt(i + 1) >= 0xdc00
+      && source.charCodeAt(i + 1) <= 0xdfff
+    ) {
+      measuredBytes += 4;
+      i += 1;
+    } else {
+      measuredBytes += 3;
+    }
+    if (measuredBytes > MAX_HIGHLIGHT_BYTES) return false;
+  }
+  return true;
+}
+
 // resolveLang maps a markdown fence tag or guessed name to a registered language,
 // or "" when we can't highlight it (caller renders escaped plain text).
 export function resolveLang(lang?: string): string {
