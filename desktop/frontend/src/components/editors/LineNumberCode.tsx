@@ -31,13 +31,19 @@ export function findCodeMatches(
   query: string,
   caseSensitive = false,
   wholeWord = false,
+  useRegex = false,
   maxMatches = MAX_SEARCH_MATCHES,
 ): CodeSearchResult {
   if (!query) return { matches: [], truncated: false };
 
   const matches: CodeSearchMatch[] = [];
   const lines = typeof source === "string" ? source.split("\n") : source;
-  const pattern = new RegExp(escapeRegex(query), caseSensitive ? "gu" : "giu");
+  let pattern: RegExp;
+  try {
+    pattern = new RegExp(useRegex ? query : escapeRegex(query), caseSensitive ? "gu" : "giu");
+  } catch {
+    return { matches: [], truncated: false };
+  }
   let absoluteOffset = 0;
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -210,13 +216,14 @@ export default function LineNumberCode({
   const [searchQuery, setSearchQuery] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
+  const [useRegex, setUseRegex] = useState(false);
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const searchTimerRef = useRef<number | null>(null);
 
   const searchResult = useMemo(
-    () => findCodeMatches(lines, searchQuery, caseSensitive, wholeWord),
-    [lines, searchQuery, caseSensitive, wholeWord],
+    () => findCodeMatches(lines, searchQuery, caseSensitive, wholeWord, useRegex),
+    [lines, searchQuery, caseSensitive, wholeWord, useRegex],
   );
   const matches = searchResult.matches;
   const totalMatches = matches.length;
@@ -358,7 +365,7 @@ export default function LineNumberCode({
 
   return (
     <div
-      className={`code-block__wrap${searchOpen ? " code-block__wrap--search-open" : ""}`}
+      className="code-block__wrap"
       onKeyDownCapture={(event) => {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
           event.preventDefault();
@@ -378,6 +385,12 @@ export default function LineNumberCode({
     >
       {searchOpen && (
         <div className="code-search">
+          <span className="code-search__icon" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <circle cx="6.5" cy="6.5" r="5" />
+              <path d="M10.5 10.5L14 14" />
+            </svg>
+          </span>
           <input
             ref={inputRef}
             type="text"
@@ -397,34 +410,13 @@ export default function LineNumberCode({
             <span className="code-search__count">
               {searchPending
                 ? t("common.loading")
-                : t("workspace.searchCount", {
-                  current: totalMatches > 0 ? activeMatchIndex + 1 : 0,
-                  total: totalMatchLabel,
-                })}
+                : totalMatches > 0
+                  ? t("workspace.searchCount", {
+                    current: activeMatchIndex + 1,
+                    total: totalMatchLabel,
+                  })
+                  : t("workspace.searchNoResults")}
             </span>
-          )}
-
-          {query && !searchPending && totalMatches > 0 && (
-            <>
-              <button
-                className="code-search__nav"
-                onClick={() => jumpToMatch(-1)}
-                aria-label={t("workspace.searchPrevious")}
-                title={t("workspace.searchPrevious")}
-                type="button"
-              >
-                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2L2 6l4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </button>
-              <button
-                className="code-search__nav"
-                onClick={() => jumpToMatch(1)}
-                aria-label={t("workspace.searchNext")}
-                title={t("workspace.searchNext")}
-                type="button"
-              >
-                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </button>
-            </>
           )}
 
           <button
@@ -453,6 +445,43 @@ export default function LineNumberCode({
           >
             ab
           </button>
+          <button
+            className={`code-search__toggle${useRegex ? " code-search__toggle--on" : ""}`}
+            onClick={() => {
+              setCurrentMatchIdx(0);
+              setUseRegex((enabled) => !enabled);
+            }}
+            aria-label={t("workspace.searchUseRegex")}
+            aria-pressed={useRegex}
+            title={t("workspace.searchUseRegex")}
+            type="button"
+          >
+            *
+          </button>
+
+          {query && !searchPending && totalMatches > 0 && (
+            <>
+              <button
+                className="code-search__nav"
+                onClick={() => jumpToMatch(-1)}
+                aria-label={t("workspace.searchPrevious")}
+                title={t("workspace.searchPrevious")}
+                type="button"
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2L2 6l4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              </button>
+              <button
+                className="code-search__nav"
+                onClick={() => jumpToMatch(1)}
+                aria-label={t("workspace.searchNext")}
+                title={t("workspace.searchNext")}
+                type="button"
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              </button>
+            </>
+          )}
+
           <button
             className="code-search__close"
             onClick={closeSearch}
