@@ -172,6 +172,20 @@ function textarea(): HTMLTextAreaElement {
   return node;
 }
 
+function updateTextareaFromUser(value: string, inputType: "insertText" | "deleteContentBackward") {
+  const input = textarea();
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+  if (!setter) throw new Error("textarea value setter is unavailable");
+  setter.call(input, value);
+  input.dispatchEvent(new window.InputEvent("input", {
+    bubbles: true,
+    data: inputType === "insertText" ? value.slice(-1) : null,
+    inputType,
+  }));
+  input.dispatchEvent(new window.Event("change", { bubbles: true }));
+  input.dispatchEvent(new window.KeyboardEvent("keyup", { key: "x", bubbles: true }));
+}
+
 function sendButton(): HTMLButtonElement {
   const node = document.querySelector(".composer__btn--send") as HTMLButtonElement | null;
   if (!node) throw new Error("composer send button did not render");
@@ -464,6 +478,51 @@ console.log("\ncomposer session draft");
   });
   eq(redo.defaultPrevented, true, "Ctrl+Shift+Z redoes the programmatic paste transaction");
   eq(textarea().value, typedPrefix + normalizedPaste, "redo restores the short paste after existing text");
+
+  const undoAgain = new window.KeyboardEvent("keydown", {
+    key: "z",
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textarea().dispatchEvent(undoAgain);
+    await flushTimers();
+  });
+  eq(textarea().value, typedPrefix, "a second undo returns to the pre-paste boundary");
+
+  await act(async () => {
+    updateTextareaFromUser(`${typedPrefix}X`, "insertText");
+    await flushTimers();
+  });
+  await rerender();
+  eq(textarea().value, `${typedPrefix}X`, "ordinary typing after paste undo updates the draft");
+  await act(async () => {
+    updateTextareaFromUser(typedPrefix, "deleteContentBackward");
+    await flushTimers();
+  });
+  await rerender();
+
+  const staleRedo = new window.KeyboardEvent("keydown", {
+    key: "Z",
+    ctrlKey: true,
+    shiftKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textarea().dispatchEvent(staleRedo);
+    await flushTimers();
+  });
+  eq(staleRedo.defaultPrevented, false, "a new native edit invalidates the programmatic redo transaction");
+  eq(textarea().value, typedPrefix, "stale redo cannot resurrect an earlier paste");
+
+  await act(async () => {
+    const input = textarea();
+    input.selectionStart = input.selectionEnd = typedPrefix.length;
+    input.dispatchEvent(textPasteEvent(rawPaste));
+    await flushTimers();
+  });
 
   await act(async () => {
     sendButton().click();

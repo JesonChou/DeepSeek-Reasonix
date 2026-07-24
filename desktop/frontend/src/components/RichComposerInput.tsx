@@ -33,7 +33,7 @@ export type RichSlashQuery = {
 export type RichComposerInputHandle = {
   focus: () => void;
   getSelection: () => RichComposerSelection;
-  setSelectionRange: (start: number, end?: number) => void;
+  setSelectionRange: (start: number, end?: number, afterInvocationId?: string) => void;
   replaceRange: (value: string, start: number, end: number) => void;
   insertInvocation: (command: CommandInfo, query: RichSlashQuery) => void;
   scrollHeight: () => number;
@@ -565,14 +565,15 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
       if (!root) return { start: text.length, end: text.length };
       return readSelection(root);
     },
-    setSelectionRange: (start, end = start) => {
-      pendingSelectionRef.current = { start, end };
+    setSelectionRange: (start, end = start, afterInvocationId) => {
+      const target = { start, end, afterInvocationId };
+      pendingSelectionRef.current = target;
       requestAnimationFrame(() => {
         const root = rootRef.current;
         if (!root) return;
         root.focus();
-        setDomSelection(root, { start, end });
-        lastValidSelectionRef.current = { start, end };
+        setDomSelection(root, target);
+        lastValidSelectionRef.current = target;
         reportSelection();
       });
     },

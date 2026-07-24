@@ -135,7 +135,7 @@ type ComposerEditSnapshot = {
   pastedBlocks: PastedBlock[];
   openPastedLabels: string[];
   nextPasteId: number;
-  selection: { start: number; end: number };
+  selection: RichComposerSelection;
 };
 
 type ComposerEditTransaction = {
@@ -840,7 +840,7 @@ export function Composer({
 
   const composerEditSnapshot = (
     targetDraftKey: string,
-    selection?: { start: number; end: number },
+    selection?: RichComposerSelection,
   ): ComposerEditSnapshot => {
     if (targetDraftKey === activeDraftKeyRef.current) {
       return {
@@ -863,6 +863,7 @@ export function Composer({
       selection: {
         start,
         end: Math.min(selection?.end ?? start, draft.text.length),
+        afterInvocationId: selection?.afterInvocationId,
       },
     };
   };
@@ -880,6 +881,11 @@ export function Composer({
     const created: ComposerEditHistory = { undo: [], redo: [] };
     editHistoryByDraftRef.current[targetDraftKey] = created;
     return created;
+  };
+
+  const discardComposerRedo = (targetDraftKey: string) => {
+    const history = editHistoryByDraftRef.current[targetDraftKey];
+    if (history) history.redo = [];
   };
 
   const recordComposerEdit = (
@@ -919,7 +925,11 @@ export function Composer({
     setOpenPastedLabels(openPastedLabels);
     setComposerPrompt(null);
     resetPromptHistoryNavigation();
-    setComposerSelection(snapshot.selection.start, snapshot.selection.end);
+    setComposerSelection(
+      snapshot.selection.start,
+      snapshot.selection.end,
+      snapshot.selection.afterInvocationId,
+    );
   };
 
   const updatePendingGuidanceForDraft = (
@@ -1398,10 +1408,10 @@ export function Composer({
     return { start: Math.min(start, end), end: Math.max(start, end) };
   };
 
-  const setComposerSelection = (start: number, end = start) => {
+  const setComposerSelection = (start: number, end = start, afterInvocationId?: string) => {
     requestAnimationFrame(() => {
       if (invocationsRef.current.length > 0) {
-        richInputRef.current?.setSelectionRange(start, end);
+        richInputRef.current?.setSelectionRange(start, end, afterInvocationId);
         return;
       }
       const ta = taRef.current;
@@ -1998,7 +2008,7 @@ export function Composer({
     const start = selection.start;
     const end = selection.end;
     const sourceDraftKey = activeDraftKeyRef.current;
-    const beforeEdit = composerEditSnapshot(sourceDraftKey, { start, end });
+    const beforeEdit = composerEditSnapshot(sourceDraftKey, selection);
 
     // Normalize CRLF from Windows clipboard so caret offsets match the
     // textarea's normalized value. The raw text (with CRLF) is preserved
@@ -2052,11 +2062,12 @@ export function Composer({
       from,
       to,
       selected: text.slice(from, to),
+      afterInvocationId: start === end ? selection.afterInvocationId : undefined,
     };
   };
 
-  const focusInputRange = (start: number, end = start) => {
-    setComposerSelection(start, end);
+  const focusInputRange = (start: number, end = start, afterInvocationId?: string) => {
+    setComposerSelection(start, end, afterInvocationId);
   };
 
   const replaceInputRange = (
@@ -2064,10 +2075,19 @@ export function Composer({
     start: number,
     end: number,
     targetDraftKey = activeDraftKeyRef.current,
+    afterInvocationId?: string,
   ) => {
+    discardComposerRedo(targetDraftKey);
     if (targetDraftKey === activeDraftKeyRef.current) {
       const current = textRef.current;
-      const next = replaceInvocationTextRange(current, invocationsRef.current, start, end, value);
+      const next = replaceInvocationTextRange(
+        current,
+        invocationsRef.current,
+        start,
+        end,
+        value,
+        afterInvocationId,
+      );
       textRef.current = next.text;
       invocationsRef.current = next.invocations;
       setText(next.text);
@@ -2076,7 +2096,14 @@ export function Composer({
       return;
     }
     const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
-    const next = replaceInvocationTextRange(draft.text, draft.invocations, start, end, value);
+    const next = replaceInvocationTextRange(
+      draft.text,
+      draft.invocations,
+      start,
+      end,
+      value,
+      afterInvocationId,
+    );
     draft.text = next.text;
     draft.invocations = next.invocations;
     draftsBySessionRef.current[targetDraftKey] = draft;
@@ -2087,24 +2114,36 @@ export function Composer({
     start: number,
     end: number,
     targetDraftKey = activeDraftKeyRef.current,
+    afterInvocationId?: string,
   ) => {
     const normalizedPasted = pasted.replace(/\r\n/g, "\n");
-    const beforeEdit = composerEditSnapshot(targetDraftKey, { start, end });
+    const beforeEdit = composerEditSnapshot(targetDraftKey, { start, end, afterInvocationId });
     let caret: number;
     if (targetDraftKey !== activeDraftKeyRef.current) {
       const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+      let inserted: string;
       if (shouldFoldPaste(pasted)) {
         const id = draft.nextPasteId++;
         const lines = lineCount(pasted);
         const label = t("composer.pastedLabel", { id, lines });
         draft.pastedBlocks = [...draft.pastedBlocks, { label, text: pasted }];
-        draft.text = draft.text.slice(0, start) + label + draft.text.slice(end);
+        inserted = label;
         caret = start + label.length;
       } else {
         draft.historyIndex = -1;
-        draft.text = draft.text.slice(0, start) + normalizedPasted + draft.text.slice(end);
+        inserted = normalizedPasted;
         caret = start + normalizedPasted.length;
       }
+      const next = replaceInvocationTextRange(
+        draft.text,
+        draft.invocations,
+        start,
+        end,
+        inserted,
+        afterInvocationId,
+      );
+      draft.text = next.text;
+      draft.invocations = next.invocations;
       draftsBySessionRef.current[targetDraftKey] = draft;
       recordComposerEdit(targetDraftKey, beforeEdit, composerEditSnapshot(targetDraftKey, { start: caret, end: caret }));
       return;
@@ -2115,20 +2154,36 @@ export function Composer({
       const lines = lineCount(pasted);
       const label = t("composer.pastedLabel", { id, lines });
       const block: PastedBlock = { label, text: pasted };
-      const current = textRef.current;
-      const next = current.slice(0, start) + label + current.slice(end);
+      const next = replaceInvocationTextRange(
+        textRef.current,
+        invocationsRef.current,
+        start,
+        end,
+        label,
+        afterInvocationId,
+      );
       pastedBlocksRef.current = [...pastedBlocksRef.current, block];
       setPastedBlocks((prev) => [...prev, block]);
-      textRef.current = next;
-      setText(next);
+      textRef.current = next.text;
+      invocationsRef.current = next.invocations;
+      setText(next.text);
+      setInvocations(next.invocations);
       caret = start + label.length;
       focusInputRange(caret);
     } else {
       resetPromptHistoryNavigation();
-      const current = textRef.current;
-      const next = current.slice(0, start) + normalizedPasted + current.slice(end);
-      textRef.current = next;
-      setText(next);
+      const next = replaceInvocationTextRange(
+        textRef.current,
+        invocationsRef.current,
+        start,
+        end,
+        normalizedPasted,
+        afterInvocationId,
+      );
+      textRef.current = next.text;
+      invocationsRef.current = next.invocations;
+      setText(next.text);
+      setInvocations(next.invocations);
       caret = start + normalizedPasted.length;
       focusInputRange(caret);
     }
@@ -2140,7 +2195,7 @@ export function Composer({
     const sourceDraftKey = activeDraftKeyRef.current;
     setInputMenuPoint(null);
     if (!selection.selected) {
-      focusInputRange(selection.from, selection.to);
+      focusInputRange(selection.from, selection.to, selection.afterInvocationId);
       return;
     }
     try {
@@ -2153,11 +2208,15 @@ export function Composer({
         } else if (!fallbackCopyText(selection.selected)) {
           // Every clipboard path failed. Cutting now would delete text that
           // never reached the clipboard, so keep the draft intact.
-          if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+          if (sourceDraftKey === activeDraftKeyRef.current) {
+            focusInputRange(selection.from, selection.to, selection.afterInvocationId);
+          }
           return;
         }
       } catch {
-        if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+        if (sourceDraftKey === activeDraftKeyRef.current) {
+          focusInputRange(selection.from, selection.to, selection.afterInvocationId);
+        }
         return;
       }
     }
@@ -2171,7 +2230,7 @@ export function Composer({
         composerEditSnapshot(sourceDraftKey, { start: selection.from, end: selection.from }),
       );
     } else if (sourceDraftKey === activeDraftKeyRef.current) {
-      focusInputRange(selection.from, selection.to);
+      focusInputRange(selection.from, selection.to, selection.afterInvocationId);
     }
   };
 
@@ -2192,7 +2251,9 @@ export function Composer({
     }
 
     if (!navigator.clipboard?.readText) {
-      if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+      if (sourceDraftKey === activeDraftKeyRef.current) {
+        focusInputRange(selection.from, selection.to, selection.afterInvocationId);
+      }
       return;
     }
     try {
@@ -2202,13 +2263,23 @@ export function Composer({
         // to insert" (empty clipboard, files, or unsupported types) — never
         // replace the current selection with nothing. An image may still be
         // attachable through the native clipboard path.
-        if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+        if (sourceDraftKey === activeDraftKeyRef.current) {
+          focusInputRange(selection.from, selection.to, selection.afterInvocationId);
+        }
         void attachNativeClipboardImage(false, sourceDraftKey);
         return;
       }
-      insertPastedText(pasted, selection.from, selection.to, sourceDraftKey);
+      insertPastedText(
+        pasted,
+        selection.from,
+        selection.to,
+        sourceDraftKey,
+        selection.afterInvocationId,
+      );
     } catch {
-      if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+      if (sourceDraftKey === activeDraftKeyRef.current) {
+        focusInputRange(selection.from, selection.to, selection.afterInvocationId);
+      }
     }
   };
 
@@ -2605,7 +2676,13 @@ export function Composer({
     setDirectPastChats(false);
     setShowPastChats(false);
     setDismissed(false);
-    replaceInputRange(value, selection.from, selection.to);
+    replaceInputRange(
+      value,
+      selection.from,
+      selection.to,
+      activeDraftKeyRef.current,
+      selection.afterInvocationId,
+    );
     if (trigger === "#") {
       setDirectPastChats(true);
       void openPastChats();
@@ -2910,8 +2987,7 @@ export function Composer({
     // boundary, so typing after a paste is undone natively first.
     const primaryModifier = shortcutPlatform === "darwin" ? e.metaKey : e.ctrlKey;
     const undoShortcut = primaryModifier && !e.shiftKey && e.key.toLowerCase() === "z";
-    const redoShortcut = (primaryModifier && e.shiftKey && e.key.toLowerCase() === "z")
-      || (shortcutPlatform !== "darwin" && e.ctrlKey && e.key.toLowerCase() === "y");
+    const redoShortcut = primaryModifier && e.shiftKey && e.key.toLowerCase() === "z";
     if (!composing && (undoShortcut || redoShortcut)) {
       const targetDraftKey = activeDraftKeyRef.current;
       const history = editHistoryForDraft(targetDraftKey);
@@ -3744,6 +3820,7 @@ export function Composer({
                   disabled={disabled || readOnly}
                   style={textareaStyle}
                   onChange={(nextText, nextInvocations) => {
+                    discardComposerRedo(activeDraftKeyRef.current);
                     resetPromptHistoryNavigation();
                     const hadInvocations = invocationsRef.current.length > 0;
                     textRef.current = nextText;
@@ -3784,6 +3861,7 @@ export function Composer({
                   aria-label={t("composer.placeholder")}
                   value={text}
                   onChange={(e) => {
+                    discardComposerRedo(activeDraftKeyRef.current);
                     resetPromptHistoryNavigation();
                     textRef.current = e.target.value;
                     setText(e.target.value);

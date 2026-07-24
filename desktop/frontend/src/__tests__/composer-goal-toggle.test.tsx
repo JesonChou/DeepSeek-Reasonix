@@ -6,10 +6,11 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer, composerPickFileEntry } from "../components/Composer";
 import { InvocationMetadataContext, UserMessage } from "../components/Message";
+import { selectionFromDom } from "../components/RichComposerInput";
 import { LocaleProvider } from "../lib/i18n";
 import { ToastProvider } from "../lib/toast";
 import type { AppBindings } from "../lib/bridge";
-import type { StructuredInvocationSubmit } from "../lib/invocationDisplay";
+import type { ComposerInvocation, StructuredInvocationSubmit } from "../lib/invocationDisplay";
 import type { CollaborationMode, CommandInfo, DirEntry, ToolApprovalMode, TokenMode } from "../lib/types";
 
 let passed = 0;
@@ -430,6 +431,96 @@ console.log("\ncomposer goal toggle");
     await flushTimers();
   });
   eq(calls.structured[0]?.invocations[1]?.offset, expandedText.length, "trimmed structured submission keeps the normalized following invocation offset");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const command: CommandInfo = {
+    name: "writing-plans",
+    description: "Write a plan",
+    kind: "skill",
+  };
+  mockApp({
+    Commands: async () => [command],
+    ListDirForTab: async () => [],
+    SearchFileRefsForTab: async () => [],
+  });
+  const { root, rerender } = await renderComposer();
+  await replaceComposerDraft(rerender, 4201, "/writing-plans");
+  await waitFor("skill menu for paste undo selection", () => Boolean(document.querySelector(".slashmenu")));
+  const initialTextarea = document.querySelector("textarea") as HTMLTextAreaElement | null;
+  if (!initialTextarea) throw new Error("composer textarea did not render for paste undo selection");
+  await act(async () => {
+    initialTextarea.dispatchEvent(new window.KeyboardEvent("keydown", {
+      key: "Enter",
+      bubbles: true,
+      cancelable: true,
+    }));
+    await flushTimers();
+  });
+
+  let richInput = document.querySelector(".composer__rich-input") as HTMLDivElement | null;
+  let token = richInput?.querySelector<HTMLElement>(".composer-invocation-token");
+  const invocationId = token?.dataset.invocationId;
+  if (!richInput || !token || !invocationId) throw new Error("rich invocation did not render for paste undo selection");
+  const afterToken = document.createRange();
+  afterToken.setStartAfter(token);
+  afterToken.collapse(true);
+  document.getSelection()?.removeAllRanges();
+  document.getSelection()?.addRange(afterToken);
+  await act(async () => {
+    dispatchPasteText(richInput!, "pasted");
+    await flushTimers();
+  });
+  richInput = document.querySelector(".composer__rich-input") as HTMLDivElement | null;
+  if (!richInput) throw new Error("rich input disappeared after paste");
+  eq(richComposerTaskText(richInput), "pasted", "paste after an invocation inserts on the token's right side");
+
+  const undoPaste = new window.KeyboardEvent("keydown", {
+    key: "z",
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    richInput!.dispatchEvent(undoPaste);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await flushTimers();
+  });
+  eq(undoPaste.defaultPrevented, true, "Ctrl+Z restores the rich-composer paste transaction");
+
+  richInput = document.querySelector(".composer__rich-input") as HTMLDivElement | null;
+  token = richInput?.querySelector<HTMLElement>(".composer-invocation-token");
+  if (!richInput || !token) throw new Error("rich invocation disappeared after paste undo");
+  const restoredInvocation: ComposerInvocation = { id: invocationId, offset: 0, command };
+  const restoredSelection = selectionFromDom(
+    richInput,
+    new Map([[invocationId, restoredInvocation]]),
+  );
+  eq(
+    restoredSelection.ok ? restoredSelection.selection.afterInvocationId : undefined,
+    invocationId,
+    "paste undo restores the caret after the invocation token",
+  );
+
+  await act(async () => {
+    richInput!.dispatchEvent(new window.KeyboardEvent("keydown", {
+      key: "Backspace",
+      bubbles: true,
+      cancelable: true,
+    }));
+    await flushTimers();
+  });
+  ok(
+    document.querySelector(".composer-invocation-token") === null,
+    "Backspace after paste undo removes the invocation on the caret's left",
+  );
 
   await act(async () => {
     root.unmount();
