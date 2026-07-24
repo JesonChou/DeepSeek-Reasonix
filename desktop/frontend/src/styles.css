@@ -4896,8 +4896,9 @@ a[href] {
   color: var(--fg-faint);
 }
 .code-search__input {
-  width: 120px;
+  flex: 1;
   min-width: 80px;
+  max-width: 240px;
   border: 0;
   outline: none;
   background: transparent;

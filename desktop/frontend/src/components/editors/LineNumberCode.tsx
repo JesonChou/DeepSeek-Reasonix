@@ -55,7 +55,7 @@ export function findCodeMatches(
       const end = start + match[0].length;
       const startsInsideWord = start > 0 && isWordCharacter(codePointBefore(line, start));
       const endsInsideWord = end < line.length && isWordCharacter(codePointAt(line, end));
-      if (!wholeWord || (!startsInsideWord && !endsInsideWord)) {
+      if (useRegex || !wholeWord || (!startsInsideWord && !endsInsideWord)) {
         if (matches.length >= maxMatches) {
           return { matches, truncated: true };
         }
@@ -436,7 +436,7 @@ export default function LineNumberCode({
             className={`code-search__toggle${wholeWord ? " code-search__toggle--on" : ""}`}
             onClick={() => {
               setCurrentMatchIdx(0);
-              setWholeWord((enabled) => !enabled);
+              setWholeWord((enabled) => { if (useRegex && !enabled) setUseRegex(false); return !enabled; });
             }}
             aria-label={t("workspace.searchWholeWord")}
             aria-pressed={wholeWord}
@@ -449,7 +449,7 @@ export default function LineNumberCode({
             className={`code-search__toggle${useRegex ? " code-search__toggle--on" : ""}`}
             onClick={() => {
               setCurrentMatchIdx(0);
-              setUseRegex((enabled) => !enabled);
+              setUseRegex((enabled) => { if (wholeWord && !enabled) setWholeWord(false); return !enabled; });
             }}
             aria-label={t("workspace.searchUseRegex")}
             aria-pressed={useRegex}

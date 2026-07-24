@@ -63,6 +63,22 @@ ok(
   "whole-word matching respects Unicode word characters",
 );
 
+
+// regex search
+const regexMatches = findCodeMatches("a1b a2b a3b", "\\d+", false, false, true).matches;
+ok(regexMatches.length === 3, "regex search finds digit sequences");
+ok(regexMatches[0].start === 1 && regexMatches[0].end === 2, "regex anchors to correct positions");
+
+const regexCaseSensitive = findCodeMatches("HELLO hello Hello", "hello", true, false, true).matches;
+ok(regexCaseSensitive.length === 1, "case-sensitive regex respects the flag");
+
+const invalidRegex = findCodeMatches("text", "[invalid", false, false, true);
+ok(invalidRegex.matches.length === 0 && !invalidRegex.truncated, "invalid regex pattern returns empty result without crashing");
+
+const regexWholeWord = findCodeMatches("cat catch scat", "cat", false, true, true).matches;
+ok(regexWholeWord.length === 3, "useRegex bypasses wholeWord when both are enabled");
+ok(regexWholeWord[0].lineIndex === 0 && regexWholeWord[0].start === 0 && regexWholeWord[0].end === 3, "regex + wholeWord matches standalone word only");
+
 const cappedMatches = findCodeMatches("x".repeat(MAX_SEARCH_MATCHES + 1), "x");
 ok(cappedMatches.matches.length === MAX_SEARCH_MATCHES, "caps pathological result sets");
 ok(cappedMatches.truncated, "reports capped result sets to the viewer");
