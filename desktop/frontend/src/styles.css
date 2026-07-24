@@ -4883,6 +4883,7 @@ a[href] {
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  max-width: calc(100% - 16px);
   font-family: var(--font-sans);
   font-size: var(--font-sm);
 }
@@ -4896,9 +4897,8 @@ a[href] {
   color: var(--fg-faint);
 }
 .code-search__input {
-  flex: 1;
-  min-width: 80px;
-  max-width: 240px;
+  flex: 1 1 60px;
+  min-width: 60px;
   border: 0;
   outline: none;
   background: transparent;
