@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"reasonix/internal/event"
-	"reasonix/internal/hook"
 	"reasonix/internal/memory"
 	"reasonix/internal/skill"
 )
@@ -132,18 +131,13 @@ func TestSlashArgItems(t *testing.T) {
 	}
 	// /hooks
 	items, _ = SlashArgItems("/hooks ", data)
-	if !has(items, "list") || !has(items, "trust") {
-		t.Errorf("/hooks should offer list/trust; got %v", labelsOf(items))
+	if !has(items, "list") || has(items, "trust") {
+		t.Errorf("/hooks should offer list without a trust step; got %v", labelsOf(items))
 	}
 	// /effort
 	items, _ = SlashArgItems("/effort ", data)
 	if !has(items, "auto") || !has(items, "disabled") || !has(items, "high") || !has(items, "max") || has(items, "off") {
 		t.Errorf("/effort should offer auto/disabled/high/max; got %v", labelsOf(items))
-	}
-	// /auto-plan
-	items, _ = SlashArgItems("/auto-plan ", data)
-	if !has(items, "off") || !has(items, "on") || has(items, "ask") {
-		t.Errorf("/auto-plan should offer only off/on; got %v", labelsOf(items))
 	}
 	// /goal
 	items, _ = SlashArgItems("/goal ", data)
@@ -235,16 +229,19 @@ func TestMemoryListTextIncludesArchivedMemories(t *testing.T) {
 	}
 }
 
-func TestManagementHooksTrustUsesWorkspaceRoot(t *testing.T) {
+func TestManagementHooksTrustCompatibilityNotice(t *testing.T) {
 	isolateControlConfigHome(t)
-	project := t.TempDir()
-
-	c := New(Options{WorkspaceRoot: project})
+	var notices []string
+	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e.Text)
+		}
+	})})
 	if !c.managementNotice("/hooks trust") {
-		t.Fatal("/hooks trust was not handled")
+		t.Fatal("legacy /hooks trust was not handled")
 	}
-	if !hook.IsTrusted(project, "") {
-		t.Fatal("/hooks trust did not trust the controller workspace root")
+	if len(notices) != 1 || !strings.Contains(notices[0], "enabled automatically") {
+		t.Fatalf("legacy /hooks trust notice = %v", notices)
 	}
 }
 

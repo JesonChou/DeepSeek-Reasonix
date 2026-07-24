@@ -124,6 +124,63 @@ Execution failures use `subtype: "error_during_execution"` and
 `is_error: true`. Structured modes keep runtime errors in JSON instead of also
 printing a duplicate human-readable error.
 
+### Redacted machine interfaces
+
+Use the dedicated event flag when an automation needs lifecycle telemetry but
+must not receive prompts, reasoning, tool arguments, tool output, or approval
+text:
+
+```sh
+reasonix run --events-jsonl "run the focused tests"
+```
+
+Every line has `schema_version`, `sequence`, and `kind`; the final line is
+`kind: "run_done"`. `--events-jsonl` is intentionally separate from the richer
+`--output-format stream-json` contract and cannot be combined with
+`--output-format`.
+
+The following read-only commands expose persisted state without transcript,
+label, command, output, path, PID, or host-name content. Here, read-only means
+the commands do not mutate transcript, runtime, recovery, or query state. The
+first redacted-machine invocation may initialize a private identity key in the
+Reasonix user-state directory:
+
+```sh
+reasonix session list --json [--dir SESSION_DIR]
+reasonix session show <machine-session-id> --json [--dir SESSION_DIR]
+reasonix session status <machine-session-id> --json [--dir SESSION_DIR]
+reasonix session recovery [<machine-session-id>] --json [--dir SESSION_DIR]
+reasonix task list --json [--dir SESSION_DIR] [--session MACHINE_SESSION_ID]
+reasonix task show <task-id> --json [--dir SESSION_DIR] [--session MACHINE_SESSION_ID]
+reasonix hook list --json [--project-root PATH] [--home-dir PATH]
+reasonix hook status --json [--project-root PATH] [--home-dir PATH]
+```
+
+For `session` and `task`, `--dir` explicitly selects the session storage
+directory; without it, Reasonix selects the current project's session store.
+For `hook`, `--dir` is an alias for `--project-root`.
+`hook list` reports `active` or `invalid`; `invalid` means the
+configured event cannot execute because its event, command/context source, or
+tool-event matcher is unusable. Matchers on non-tool events are ignored.
+
+Machine session IDs are keyed opaque hashes, not transcript file names. They
+remain stable for the same session and Reasonix user-state directory, while a
+different installation key produces unrelated IDs and prevents offline guesses
+from timestamps or model labels. Preserve the private identity key when moving
+the Reasonix state directory if automation depends on existing machine IDs.
+Task `finished_at` is empty while a task is running, and
+`artifact_complete=true` is emitted only for a terminal task whose persisted
+artifact exists. A `running` record without a live session lease is reported as
+`interrupted`; opening that session also repairs the persisted lifecycle state.
+
+Schema compatibility rules for version 1:
+
+- consumers must ignore unknown fields;
+- fields are not removed or retyped within the same schema version;
+- empty collections are encoded as `[]`;
+- argument errors exit with status `2`, state/query errors with status `1`;
+- machine-command errors are JSON objects with a stable `error.code`.
+
 ## Resume sessions
 
 ```sh
@@ -225,12 +282,17 @@ selection, scrollbar, and footer use the active CLI theme. See
 multiline input, rewind, and clipboard controls.
 
 Clipboard actions are deliberately split by content type. Local transcript
-selection uses the native system clipboard and reports success only after that
-write completes; SSH falls back to an explicitly labelled OSC 52 request. Text
-paste remains the terminal's bracketed-paste action (`Cmd+V` on macOS and the
-terminal's configured shortcut elsewhere). Image paste is application-owned:
-use `Ctrl+V` on macOS/Linux, `Alt+V` on Windows, or `/paste-image`; the footer
-shows `Pasting image…` until the attachment token is ready.
+and composer selections use the native system clipboard and report success only
+after that write completes; SSH falls back to an explicitly labelled OSC 52
+request. Text paste remains the terminal's bracketed-paste action (`Cmd+V` on
+macOS and the terminal's configured shortcut elsewhere). While Reasonix owns the
+mouse in a local session, right-click with no selection reads clipboard text
+through the same paste path; right-click with a selection copies it. Over SSH,
+use the terminal paste shortcut because the remote process cannot read the local
+clipboard; `/mouse` restores the terminal's native right-click menu. Image paste
+is application-owned: use `Ctrl+V` on macOS/Linux, `Alt+V` on Windows, or
+`/paste-image`; the footer shows `Pasting image…` until the attachment token is
+ready.
 
 ## In-session commands
 

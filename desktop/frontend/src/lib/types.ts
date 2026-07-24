@@ -1,6 +1,8 @@
 // Wire contract — mirrors desktop/wire.go (itself mirroring internal/serve/wire.go).
 // One event channel carries every kind; `kind` discriminates the payload.
 
+import type { Todo } from "./tools";
+
 export type EventKind =
   | "turn_started"
   | "reasoning"
@@ -38,6 +40,8 @@ export interface WireTool {
   id?: string;
   name: string;
   args?: string;
+  resolvedName?: string;
+  capabilityId?: string;
   output?: string;
   err?: string;
   readOnly: boolean;
@@ -84,28 +88,30 @@ export interface WireUsage {
   costUsd?: number;
 }
 
+export interface WireRecoveryApproval {
+  source_agent?: string;
+  failed_tool?: string;
+  failed_summary?: string;
+  diagnosis?: string;
+  next_tool?: string;
+  next_action?: string;
+  change_kind?: string;
+  change_rationale?: string;
+  review_rationale?: string;
+  plan_before?: string;
+  plan_after?: string;
+  can_grant_task?: boolean;
+  task_grant_scope?: string;
+}
+
 export interface WireApproval {
   id: string;
   tool: string;
   subject: string;
   reason?: string;
   fresh?: boolean;
-  mcpTrust?: WireMCPTrust;
-}
-
-export interface WireMCPTrust {
-  server: string;
-  trustState: string;
-  trustSource?: string;
-  trustScope?: string;
-  isolationState: string;
-  isolationReason?: string;
-  identityChanged?: boolean;
-  changedTools: string[];
-  toolChanges: MCPToolTrustChangeView[];
-  readers: string[];
-  writers: string[];
-  destructive: string[];
+  kind?: "tool" | "plan" | "recovery" | string;
+  recovery?: WireRecoveryApproval;
 }
 
 export interface WireGuardian {
@@ -169,19 +175,37 @@ export interface WireEvent {
   compaction?: WireCompaction;
   guardian?: WireGuardian;
   err?: string;
-  outcome?: "final_readiness";
+  outcome?: "final_readiness" | "recovery_paused";
   readiness?: WireFinalReadiness;
   retryAttempt?: number;
   retryMax?: number;
   // Tab routing: set by the Go-side tabEventSink so multi-tab frontends
   // route each event to the correct per-tab reducer.
   tabId?: string;
+  runtimeEpoch?: string;
   sessionHitTokens?: number;
   sessionMissTokens?: number;
   sessionCost?: number;
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
+}
+
+export type SessionRuntimePhase = "starting" | "ready" | "lease_blocked" | "failed" | "closing";
+
+export interface SessionRuntimeIssue {
+  code: "session_lease_held" | "startup_failed";
+  message: string;
+  retryable: boolean;
+  holderPid?: number;
+  holderHost?: string;
+  acquiredAt?: string;
+}
+
+export interface SessionRuntimeView {
+  phase: SessionRuntimePhase;
+  epoch: string;
+  issue?: SessionRuntimeIssue;
 }
 
 export interface WireFinalReadiness {
@@ -207,6 +231,7 @@ export interface TabMeta {
   projectColor?: string;
   label: string;
   ready: boolean;
+  runtime?: SessionRuntimeView;
   running: boolean;
   pendingPrompt?: boolean;
   backgroundJobs?: number;
@@ -378,6 +403,9 @@ export interface HistoryToolCall {
   id: string;
   name: string;
   arguments: string;
+  resolvedName?: string;
+  capabilityId?: string;
+  resolvedReadOnly?: boolean;
   subject?: string;
   summary?: string;
   diff?: string;
@@ -480,6 +508,7 @@ export interface ContextInfo {
 export interface Meta {
   label: string;
   ready: boolean;
+  runtime?: SessionRuntimeView;
   startupErr?: string;
   eventChannel: string;
   cwd: string;
@@ -497,6 +526,7 @@ export interface Meta {
   goal?: string;
   goalStatus?: GoalStatus;
   autoResearch?: AutoResearchCompactView;
+  canonicalTodos?: Todo[];
 }
 
 export type CollaborationMode = "normal" | "plan" | "goal";
@@ -669,6 +699,15 @@ export interface WorkspaceChangesView {
   gitBranch?: string;
 }
 
+export interface WorkspaceChangeDetailView {
+  diff?: string;
+  source?: "git" | "session";
+  added?: number;
+  removed?: number;
+  binary?: boolean;
+  truncated?: boolean;
+}
+
 export interface GitCommitView {
   hash: string;
   author: string;
@@ -693,11 +732,21 @@ export interface ServerView {
   name: string;
   transport: string;
   status: "connected" | "deferred" | "failed" | "initializing" | "disabled";
+  /** @deprecated derived from enabled */
   startIntent?: "off" | "automatic" | string;
   runtimeState?: "idle" | "connecting" | "ready" | "issue" | string;
+  /** Product availability: available_on_demand | starting | connected | auth_required | project_auth_changed | start_failed | disabled */
+  availability?: string;
+  enabled?: boolean;
+  installed?: boolean;
+  action?: "none" | "authenticate" | "authorize" | "retry" | string;
+  source?: "project" | "user" | "plugin" | "builtin" | string;
+  configSource?: string;
   builtIn?: boolean;
   configured?: boolean;
+  /** @deprecated same as enabled */
   autoStart: boolean;
+  /** @deprecated ignored by runtime */
   tier?: "background" | "eager" | string;
   command?: string;
   args?: string[];
@@ -705,39 +754,19 @@ export interface ServerView {
   envKeys?: string[];
   headerKeys?: string[];
   tools: number;
+  toolCount?: number;
   prompts: number;
   resources: number;
   hasTools?: boolean;
   error?: string;
-  requiresReverification?: boolean;
   toolList?: MCPToolView[];
-  trustedReadOnlyTools?: string[];
   callTimeoutSeconds?: number;
   toolTimeoutSeconds?: Record<string, number>;
-  defaultToolsApprovalMode?: MCPApprovalMode;
-  toolPolicies?: Record<string, MCPToolPolicy>;
-  approvalsReviewer?: MCPApprovalsReviewer;
   requiresLaunchApproval?: boolean;
-  launchApprovalGoverned?: boolean;
   authStatus?: "none" | "possible" | "required" | string;
   authUrl?: string;
   authConfigured?: boolean;
   managedByPlugin?: string;
-  trustState?: "official" | "workspace" | "session" | "changed" | "untrusted" | string;
-  trustSource?: "user" | "official_catalog" | "legacy_import" | string;
-  trustScope?: "session" | "workspace" | "global" | string;
-  isolationState?: "enforced" | "unavailable_unconfined" | "not_applicable" | string;
-  isolationReason?: string;
-  identityChanged?: boolean;
-  changedTools?: string[];
-  toolChanges?: MCPToolTrustChangeView[];
-  catalogSequence?: number;
-  verifiedVersion?: string;
-}
-export type MCPApprovalMode = "auto" | "prompt" | "writes" | "approve";
-export type MCPApprovalsReviewer = "user" | "auto_review";
-export interface MCPToolPolicy {
-  approval_mode: MCPApprovalMode;
 }
 export interface MCPToolView {
   name: string;
@@ -745,35 +774,6 @@ export interface MCPToolView {
   readOnlyHint?: boolean;
   destructiveHint?: boolean;
   schemaError?: string;
-  trustedReader?: boolean;
-}
-
-export interface MCPToolTrustChangeView {
-  name: string;
-  kind: "added" | "reader_to_writer" | "reader_to_destructive" | "writer_to_reader" | "safety_changed" | "name_changed" | "schema_changed" | string;
-}
-
-export interface MCPTrustInspectionView {
-  name: string;
-  trustState: string;
-  trustSource?: string;
-  trustScope?: string;
-  isolationState: string;
-  isolationReason?: string;
-  identityChanged?: boolean;
-  changedTools: string[];
-  toolChanges?: MCPToolTrustChangeView[];
-  readers: string[];
-  writers: string[];
-  destructive: string[];
-  requiresLaunchApproval?: boolean;
-}
-
-export interface MCPCatalogRefreshView {
-  source: string;
-  sequence: number;
-  offline: boolean;
-  stale?: boolean;
 }
 export interface SkillView {
   name: string;
@@ -785,6 +785,7 @@ export interface SkillView {
   model?: string;
   effort?: string;
   allowedTools?: string[];
+  readOnly?: boolean;
   color?: string;
   invocation?: string;
   invocationMode?: string;
@@ -833,6 +834,7 @@ export interface SubagentProfileInput {
   model?: string;
   effort?: string;
   allowedTools?: string[];
+  readOnly?: boolean;
   scope?: "project" | "global";
 }
 export interface PluginView {
@@ -858,13 +860,6 @@ export interface PluginView {
   mcpServerDetails?: PluginMCPServerView[];
   warnings?: string[];
   error?: string;
-  verification?: {
-    catalogEntryId: string;
-    commit: string;
-    packageSha256: string;
-    verifiedAt: string;
-    catalogSequence: number;
-  };
 }
 export interface PluginCompatibilityIssue {
   capability: string;
@@ -925,13 +920,38 @@ export interface MCPServerInput {
   url: string;
   env?: Record<string, string> | null;
   headers?: Record<string, string> | null;
-  trustedReadOnlyTools?: string[];
   autoStart?: boolean | null;
   callTimeoutSeconds?: number | null;
   toolTimeoutSeconds?: Record<string, number> | null;
-  defaultToolsApprovalMode?: MCPApprovalMode | "" | null;
-  tools?: Record<string, MCPToolPolicy> | null;
-  approvalsReviewer?: MCPApprovalsReviewer | "" | null;
+}
+
+export interface MCPInstallResult {
+  name: string;
+  state: "ready" | "action_required" | "issue";
+  toolCount: number;
+  action: "none" | "authenticate" | "authorize" | "retry";
+  message: string;
+}
+
+export interface MCPMarketplaceEntry {
+  name: string;
+  suggestedName: string;
+  title?: string;
+  description?: string;
+  version?: string;
+  repositoryUrl?: string;
+  installable: boolean;
+  unavailableReason?: string;
+  transport?: "stdio" | "http" | "sse" | string;
+  command?: string;
+  args: string[];
+  url?: string;
+}
+
+export interface MCPMarketplaceView {
+  servers: MCPMarketplaceEntry[];
+  cached: boolean;
+  warning?: string;
 }
 
 export interface ModelInfo {
@@ -1026,7 +1046,155 @@ export interface MemoryView {
 }
 
 // SettingsTab is the top-level navigation item in the Settings Centre modal.
-export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "subagents" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "remote" | "skills" | "subagents" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+
+// ── Remote SSH module (mirrors desktop/remote_app.go view structs) ──
+
+export type RemoteConnState =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "degraded"
+  | "pending_hostkey"
+  | "pending_secret"
+  | "stopped";
+
+export type RemoteServerState =
+  | "starting"
+  | "detect"
+  | "install"
+  | "waiting_lock"
+  | "launch"
+  | "health_check"
+  | "ready"
+  | "error"
+  | "stopped"
+  | "reuse";
+
+export interface RemoteHostView {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  user: string;
+  identityFile: string;
+  proxyJump: string;
+  defaultWorkspace: string;
+  serveInstall: string;
+  useSSHConfig: boolean;
+  passwordSet?: boolean;
+  keyPassphraseSet?: boolean;
+}
+
+export interface RemoteHostInput {
+  label: string;
+  host: string;
+  port: number;
+  user: string;
+  identityFile: string;
+  proxyJump: string;
+  defaultWorkspace: string;
+  serveInstall: string;
+  useSSHConfig: boolean;
+  password?: string;
+  keyPassphrase?: string;
+  clearPassword?: boolean;
+  clearPassphrase?: boolean;
+  preserveExistingSettings?: boolean;
+}
+
+export interface RemoteFingerprintView {
+  hostId: string;
+  address: string;
+  keyType: string;
+  sha256: string;
+}
+
+export interface RemoteSecretPromptView {
+  promptId: string;
+  hostId: string;
+  host: string;
+  kind: "password" | "passphrase";
+  identity?: string;
+}
+
+export interface RemoteKnownHostLocation {
+  path: string;
+  line: number;
+}
+
+export interface RemoteConnectionErrorDetails {
+  code: "connection_failed" | "auth_failed" | "host_key_rejected" | "host_key_mismatch";
+  presentedSha256?: string;
+  knownHostRecords?: RemoteKnownHostLocation[];
+}
+
+export interface RemoteConnectionStatus {
+  hostId: string;
+  state: RemoteConnState;
+  error?: string;
+  errorDetails?: RemoteConnectionErrorDetails;
+  fingerprint?: RemoteFingerprintView;
+  secretPrompt?: RemoteSecretPromptView;
+  attempt?: number;
+}
+
+export interface RemoteDirEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  mtimeUnix: number;
+  symlink: boolean;
+}
+
+export interface RemoteFilePreview {
+  path: string;
+  body: string;
+  size: number;
+  mtimeUnix: number;
+  truncated: boolean;
+  binary: boolean;
+  err?: string;
+}
+
+export interface RemoteWriteResult {
+  ok: boolean;
+  conflict: boolean;
+  newMtimeUnix: number;
+}
+
+export interface RemoteForwardInput {
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  label: string;
+}
+
+export interface RemoteForwardView {
+  id: string;
+  hostId: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  label: string;
+  state: string;
+  error?: string;
+}
+
+export interface RemoteServerView {
+  hostId: string;
+  workspace: string;
+  state: RemoteServerState;
+  message?: string;
+  localUrl?: string;
+  error?: string;
+}
+
+export interface RemoteForwardsEvent {
+  hostId: string;
+  forwards: RemoteForwardView[];
+}
 
 /** Capability diagnostics report from App.CapabilityDiagnostics (capdiag.Report). */
 export interface CapabilityDiagnosticsReport {
@@ -1181,6 +1349,7 @@ export interface ProviderModelOverrideView {
   supportedEfforts: string[];
   defaultEffort: string;
   vision?: boolean | null;
+  contextWindow?: number;
 }
 
 // BalanceInfo is the wallet-balance readout (desktop/app.go Balance). available
@@ -1239,6 +1408,8 @@ export interface AgentView {
   maxSteps: number;
   plannerMaxSteps: number;
   maxSubagentDepth: number;
+  maxSubagentConcurrency: number;
+  maxParallelWriters: number;
   systemPrompt: string;
   coldResumePrune: boolean;
   reasoningLanguage: string; // "auto" | "zh" | "en"
@@ -1482,6 +1653,7 @@ export interface SettingsView {
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   autoApproveTools: boolean;
   bypass: boolean; // legacy JSON key for live YOLO/full-access tool auto-approval
+  conversationWidth?: string; // "standard" | "full"; absent from older Wails payloads
 }
 
 export interface DesktopStartupSettingsView {
@@ -1495,6 +1667,7 @@ export interface DesktopStartupSettingsView {
   statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
   safeMode?: boolean; // recovery startup with external integrations disabled
+  conversationWidth?: string; // "standard" | "full"; absent from older Wails payloads
 }
 
 export type ExternalOpenerKind = "file-manager" | "editor" | "terminal";
@@ -1522,6 +1695,8 @@ export interface UpdateInfo {
   canSelfUpdate: boolean; // macOS true only for signed/notarized builds
   manualOnly?: boolean;
   manualReason?: string;
+  installMode?: "portable" | "deb" | "manual" | string;
+  requiresElevation?: boolean;
   downloaded: boolean;
   downloadUrl: string; // human-facing releases page (macOS path / fallback link)
   assetSize: number; // running platform's artifact size, for the progress bar
@@ -1537,7 +1712,7 @@ export interface UpdateDownloadResult {
 }
 
 export interface UpdateProgress {
-  phase: "downloading" | "verifying" | "downloaded" | "installing" | "done" | "error";
+  phase: "downloading" | "verifying" | "downloaded" | "authorizing" | "installing" | "done" | "error";
   received: number;
   total: number;
   err?: string;

@@ -106,6 +106,139 @@ func TestSnapshotUpToDateFastPath(t *testing.T) {
 	}
 }
 
+func TestSaveSnapshotBoundsCrossProcessFileLockWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lock, err := tryTakeSessionLockFile(store.SessionLockFile(path))
+	if err != nil {
+		t.Fatalf("take competing session lock: %v", err)
+	}
+	defer lock.Unlock()
+
+	prevWait, prevPoll := sessionFileLockWait, sessionFileLockPollInterval
+	sessionFileLockWait = 40 * time.Millisecond
+	sessionFileLockPollInterval = 5 * time.Millisecond
+	defer func() {
+		sessionFileLockWait = prevWait
+		sessionFileLockPollInterval = prevPoll
+	}()
+
+	s := NewSession("sys")
+	s.Add(provider.Message{Role: provider.RoleUser, Content: "must stay in memory"})
+	started := time.Now()
+	err = s.SaveSnapshot(path)
+	if !errors.Is(err, ErrSessionFileLockHeld) {
+		t.Fatalf("SaveSnapshot error = %v, want ErrSessionFileLockHeld", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("SaveSnapshot waited %v for a held cross-process lock; want a bounded failure", elapsed)
+	}
+	if got := s.Snapshot(); len(got) != 2 || got[1].Content != "must stay in memory" {
+		t.Fatalf("failed save changed in-memory transcript: %+v", got)
+	}
+}
+
+func TestSaveSnapshotSucceedsWhenCrossProcessFileLockReleasesBeforeDeadline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lock, err := tryTakeSessionLockFile(store.SessionLockFile(path))
+	if err != nil {
+		t.Fatalf("take competing session lock: %v", err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		lock.Unlock()
+		close(released)
+	}()
+	t.Cleanup(func() { <-released })
+
+	prevWait, prevPoll := sessionFileLockWait, sessionFileLockPollInterval
+	sessionFileLockWait = 500 * time.Millisecond
+	sessionFileLockPollInterval = 5 * time.Millisecond
+	defer func() {
+		sessionFileLockWait = prevWait
+		sessionFileLockPollInterval = prevPoll
+	}()
+
+	s := NewSession("sys")
+	s.Add(provider.Message{Role: provider.RoleUser, Content: "save after transient lock"})
+	if err := s.SaveSnapshot(path); err != nil {
+		t.Fatalf("SaveSnapshot after transient lock: %v", err)
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("SaveSnapshot returned before the competing lock was released")
+	}
+	loaded, err := LoadSession(path)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got := loaded.Snapshot(); len(got) != 2 || got[1].Content != "save after transient lock" {
+		t.Fatalf("persisted transcript = %+v", got)
+	}
+}
+
+func TestSaveShutdownRecoveryBranchBypassesHeldOriginalFileLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	base := NewSession("sys")
+	base.Add(provider.Message{Role: provider.RoleUser, Content: "persisted"})
+	if err := base.SaveSnapshot(path); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	current, err := LoadSession(path)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	current.Add(provider.Message{Role: provider.RoleAssistant, Content: "unsaved shutdown tail"})
+	lock, err := tryTakeSessionLockFile(store.SessionLockFile(path))
+	if err != nil {
+		t.Fatalf("take competing session lock: %v", err)
+	}
+	defer lock.Unlock()
+
+	prevWait, prevPoll := sessionFileLockWait, sessionFileLockPollInterval
+	sessionFileLockWait = 40 * time.Millisecond
+	sessionFileLockPollInterval = 5 * time.Millisecond
+	defer func() {
+		sessionFileLockWait = prevWait
+		sessionFileLockPollInterval = prevPoll
+	}()
+
+	saveErr := current.SaveSnapshot(path)
+	if !errors.Is(saveErr, ErrSessionFileLockHeld) {
+		t.Fatalf("SaveSnapshot error = %v, want ErrSessionFileLockHeld", saveErr)
+	}
+	info, err := current.SaveShutdownRecoveryBranch(RecoveryBranchOptions{
+		OriginalPath: path,
+		Reason:       "shutdown session file lock timeout",
+	})
+	if err != nil {
+		t.Fatalf("SaveShutdownRecoveryBranch: %v", err)
+	}
+	if info.Path == path {
+		t.Fatalf("shutdown recovery path = original path %q", path)
+	}
+	if !info.Meta.Recovered || info.Meta.RecoveryReason != "shutdown session file lock timeout" {
+		t.Fatalf("shutdown recovery meta = %+v", info.Meta)
+	}
+	recovered, err := LoadSession(info.Path)
+	if err != nil {
+		t.Fatalf("load shutdown recovery: %v", err)
+	}
+	if got := recovered.Snapshot(); len(got) != 3 || got[2].Content != "unsaved shutdown tail" {
+		t.Fatalf("shutdown recovery transcript = %+v", got)
+	}
+	original, err := LoadSession(path)
+	if err != nil {
+		t.Fatalf("reload original session: %v", err)
+	}
+	if got := original.Snapshot(); len(got) != 2 {
+		t.Fatalf("held original transcript changed: %+v", got)
+	}
+}
+
 // TestRepairedSessionArmsFastPath (#6613 review P2): a session loaded with a
 // damaged event log — or carrying a load-time normalization repair — must
 // re-arm the snapshot no-op fast path once a successful save persists the
@@ -2333,6 +2466,10 @@ func TestReconcileOverlongMigratesDiagnosticSidecars(t *testing.T) {
 		[]byte(`{"outcome":"forked_recovery_branch"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(store.SessionRecoveryState(oldPath),
+		[]byte(`{"tasks":{"root":{"phase":"diagnosing"}}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	// The salvage sidecar holds raw session bytes; orphaning it under the
 	// retired stem would leave unreachable transcript content behind (#6613
 	// review follow-up).
@@ -2358,7 +2495,10 @@ func TestReconcileOverlongMigratesDiagnosticSidecars(t *testing.T) {
 	if _, err := os.Stat(store.SessionConflictLog(newPath)); err != nil {
 		t.Fatalf("conflict log not migrated with the rename: %v", err)
 	}
-	for _, gone := range []string{oldPath, store.SessionEventLog(oldPath), store.SessionEventLogDamaged(oldPath), store.SessionConflictLog(oldPath)} {
+	if _, err := os.Stat(store.SessionRecoveryState(newPath)); err != nil {
+		t.Fatalf("recovery state not migrated with the rename: %v", err)
+	}
+	for _, gone := range []string{oldPath, store.SessionEventLog(oldPath), store.SessionEventLogDamaged(oldPath), store.SessionConflictLog(oldPath), store.SessionRecoveryState(oldPath)} {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
 			t.Fatalf("%s still present under the retired stem (err=%v)", filepath.Base(gone), err)
 		}

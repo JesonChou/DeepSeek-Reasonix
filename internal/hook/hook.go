@@ -172,20 +172,41 @@ func ProjectSettingsPath(projectRoot string) string {
 	return filepath.Join(projectRoot, SettingsDirname, SettingsFilename)
 }
 
-// LoadOptions configure Load. Project hooks load only when Trusted; global hooks
-// always load.
+// ContextFileUsable reports whether a plugin contextFile can take the same
+// execution path as readContextFile. Keep machine status and diagnostics on
+// this shared predicate so a path that merely exists (for example, a
+// directory) is not advertised as runnable.
+func ContextFileUsable(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	return file.Close() == nil
+}
+
+// LoadOptions configure Load.
 type LoadOptions struct {
 	ProjectRoot string
 	HomeDir     string
-	Trusted     bool
+	// Trusted is retained for source compatibility. Project hooks are enabled
+	// automatically now, so callers no longer need to set it.
+	Trusted bool
 }
 
-// Load resolves hooks: project first (only when trusted), then global; within a
-// scope, settings.json array order. A malformed file yields no hooks (never an
-// error — a typo shouldn't take down the CLI).
+// Load resolves hooks: project first, then global; within a scope,
+// settings.json array order. A malformed file yields no hooks (never an error
+// — a typo shouldn't take down the CLI).
 func Load(opts LoadOptions) []ResolvedHook {
 	var out []ResolvedHook
-	if opts.ProjectRoot != "" && opts.Trusted {
+	if opts.ProjectRoot != "" {
 		p := ProjectSettingsPath(opts.ProjectRoot)
 		if s := readSettings(p); s != nil {
 			appendResolved(&out, s, ScopeProject, p)
@@ -206,8 +227,7 @@ func Load(opts LoadOptions) []ResolvedHook {
 }
 
 // ProjectDefinesHooks reports whether a project's settings.json exists and
-// declares at least one hook — regardless of trust. Frontends use this to decide
-// whether to prompt the user to trust the project.
+// declares at least one hook.
 func ProjectDefinesHooks(projectRoot string) bool {
 	s := readSettings(ProjectSettingsPath(projectRoot))
 	if s == nil {
@@ -424,7 +444,7 @@ func cloneEnv(in map[string]string) map[string]string {
 // anchored regex; non-tool events always match. A malformed regex never fires
 // (safer than firing on everything).
 func MatchesTool(h ResolvedHook, toolName string) bool {
-	if h.Event != PreToolUse && h.Event != PostToolUse && h.Event != PostToolUseFailure && h.Event != PermissionRequest {
+	if !UsesToolMatcher(h.Event) {
 		return true
 	}
 	m := h.Match
@@ -1231,6 +1251,9 @@ func DefaultSpawner(ctx context.Context, in SpawnInput) SpawnResult {
 func spawnCommand(ctx context.Context, command string, argv ...[]string) (*exec.Cmd, error) {
 	if len(argv) > 0 && argv[0] != nil {
 		if runtime.GOOS == "windows" {
+			if cmd, matched := windowsBatchArgvCommand(ctx, command, argv[0]); matched {
+				return cmd, nil
+			}
 			if shell, args, matched, err := windowsPOSIXShellArgvInvocation(command, argv[0]); matched {
 				if err != nil {
 					return nil, err
@@ -1247,6 +1270,9 @@ func spawnCommand(ctx context.Context, command string, argv ...[]string) (*exec.
 		return exec.CommandContext(ctx, powershell, args...), nil
 	}
 	if runtime.GOOS == "windows" {
+		if cmd, matched := windowsBatchCommand(ctx, command); matched {
+			return cmd, nil
+		}
 		if shell, args, matched, err := windowsPOSIXShellInvocation(command); matched {
 			if err != nil {
 				return nil, err
@@ -1313,14 +1339,6 @@ func legacyGlobalSettingsPath(homeDir string) string {
 		return ""
 	}
 	return filepath.Join(dir, SettingsFilename)
-}
-
-func legacyTrustPath(homeDir string) string {
-	dir := legacyReasonixHome(homeDir)
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, TrustFilename)
 }
 
 func legacyReasonixHome(override string) string {

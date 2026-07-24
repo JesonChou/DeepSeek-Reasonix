@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -119,6 +120,9 @@ func Run(args []string, version string) int {
 	case "mcp":
 		configureCLIThemeFromConfigNoProbe()
 		return mcpCommand(rest)
+	case "remote":
+		configureCLIThemeFromConfigNoProbe()
+		return remoteCommand(rest, version)
 	case "plugin":
 		configureCLIThemeFromConfigNoProbe()
 		return pluginCommand(rest)
@@ -130,6 +134,15 @@ func Run(args []string, version string) int {
 			configureCLIThemeFromConfigNoProbe()
 		}
 		return doctorCommand(rest, version)
+	case "session":
+		configureCLIThemeFromConfigNoProbe()
+		return sessionCommand(rest)
+	case "hook", "hooks":
+		configureCLIThemeFromConfigNoProbe()
+		return hookCommand(rest)
+	case "task":
+		configureCLIThemeFromConfigNoProbe()
+		return taskCommand(rest)
 	case "review":
 		configureCLIThemeFromConfigNoProbe()
 		return reviewCommand(rest)
@@ -169,7 +182,7 @@ func isDefaultInteractiveFlag(arg string) bool {
 
 func shouldMigrateLegacyConfigForCLI(cmd string) bool {
 	switch cmd {
-	case "", "run", "chat", "code", "serve", "setup", "config", "init", "acp", "mcp", "plugin", "subagent", "doctor", "bot", "upgrade", "update":
+	case "", "run", "chat", "code", "serve", "setup", "config", "init", "acp", "mcp", "remote", "plugin", "subagent", "doctor", "bot", "upgrade", "update":
 		return true
 	default:
 		return false
@@ -420,6 +433,7 @@ func runAgent(args []string) int {
 	effort := fs.String("effort", "", "session reasoning effort override")
 	permissionMode := fs.String("permission-mode", "ask", "permission mode: manual | ask | auto | acceptEdits | dontAsk | plan | bypassPermissions")
 	printOnly := fs.BoolP("print", "p", false, "print only the final response")
+	eventsJSONL := fs.Bool("events-jsonl", false, "emit a redacted structured event stream as JSONL")
 	outputFormat := fs.String("output-format", "text", "output format: text | json | stream-json")
 	var additionalDirs []string
 	fs.StringArrayVar(&additionalDirs, "add-dir", nil, "allow tool access to an additional directory (repeatable)")
@@ -438,6 +452,13 @@ func runAgent(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 2
+	}
+	if *eventsJSONL {
+		if fs.Changed("output-format") {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--events-jsonl cannot be combined with --output-format")
+			return 2
+		}
+		format = runOutputEventsJSONL
 	}
 	profile, err := parseRuntimeProfile(*profileFlag)
 	if err != nil {
@@ -472,6 +493,14 @@ func runAgent(args []string) int {
 	if prompt == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.UsageRunHint)
 		return 2
+	}
+	var machineIdentityKey []byte
+	if format == runOutputEventsJSONL {
+		machineIdentityKey, err = loadMachineIdentityKey()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "machine identity is unavailable")
+			return 1
+		}
 	}
 
 	// Resolve the resume target up front so --copy and the session lease can be
@@ -603,7 +632,7 @@ func runAgent(args []string) int {
 		ctrl.Resume(resumeSession, resumePath)
 	}
 	if ctrl.SessionPath() == "" && ctrl.SessionDir() != "" {
-		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
+		ctrl.SetFreshSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
 	}
 	// Fresh sessions take the lease too (defensive: the path is brand new); a
 	// resumed path is already held, making this a no-op.
@@ -613,8 +642,13 @@ func runAgent(args []string) int {
 	}
 
 	runErr := ctrl.Run(ctx, prompt)
+	completion := classifyRunCompletion(runErr)
 	if cfg != nil {
-		notify.SendEvent(newNotificationSender(), cfg.Notifications, event.Event{Kind: event.TurnDone, Err: runErr})
+		notify.SendEvent(newNotificationSender(), cfg.Notifications, event.Event{
+			Kind:    event.TurnDone,
+			Err:     runErr,
+			Outcome: completion.outcome,
+		})
 	}
 	if metrics != nil {
 		if exec := ctrl.Executor(); exec != nil {
@@ -637,18 +671,25 @@ func runAgent(args []string) int {
 		}
 	}
 	if resultOutput != nil {
-		if err := resultOutput.Finalize(agent.BranchID(ctrl.SessionPath()), started, runErr); err != nil {
+		sessionID := runOutputSessionID(format, agent.BranchID(ctrl.SessionPath()), machineIdentityKey)
+		if err := resultOutput.Finalize(sessionID, started, runErr); err != nil {
 			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 			return 1
 		}
 	}
 	if runErr != nil {
+		if !completion.isError {
+			if format == runOutputText {
+				fmt.Fprintln(os.Stderr, "\n"+runErr.Error())
+			}
+			return completion.exitCode
+		}
 		if resultOutput == nil {
 			fmt.Fprintln(os.Stderr, "\n"+i18n.M.ErrorPrefix, runErr)
 		}
-		return 1
+		return completion.exitCode
 	}
-	return 0
+	return completion.exitCode
 }
 
 // runServe exposes the controller over HTTP+SSE: events stream to the browser,
@@ -667,6 +708,9 @@ func runServe(args []string) int {
 	password := fs.String("password", "", "password for auth=password (use --hash-password to store a hash instead)")
 	hashPassword := fs.Bool("hash-password", false, "print a bcrypt hash of --password and exit")
 	behindProxy := fs.Bool("behind-proxy", false, "trust X-Forwarded-For / X-Forwarded-Proto headers from a reverse proxy")
+	portFile := fs.String("port-file", "", "write the actual bound listen address (host:port) to this file after binding")
+	tokenFile := fs.String("token-file", "", "read the auth=token pre-shared token from this file (overrides --token; keeps the secret out of argv)")
+	pidFile := fs.String("pid-file", "", "write the server process id to this file")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -702,6 +746,14 @@ func runServe(args []string) int {
 	}
 	if *token != "" {
 		serveCfg.Token = *token
+	}
+	if *tokenFile != "" {
+		tok, err := readServeTokenFile(*tokenFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		serveCfg.Token = tok
 	}
 	if *behindProxy {
 		serveCfg.BehindProxy = true
@@ -781,14 +833,55 @@ func runServe(args []string) int {
 
 	srv := serve.New(ctrl, bc, serveCfg)
 	srv.SetSessionLeases(leases)
-	fmt.Printf("reasonix serve — %s on http://%s\n", ctrl.Label(), *addr)
+
+	// With --port-file the supervisor needs the real bound port (--addr may be
+	// 127.0.0.1:0), so listen first, record the address, then serve on the
+	// existing listener.
+	var ln net.Listener
+	displayAddr := *addr
+	if *portFile != "" {
+		var lerr error
+		ln, lerr = net.Listen("tcp", *addr)
+		if lerr != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, lerr)
+			return 1
+		}
+		displayAddr = ln.Addr().String()
+		if err := writeServeAddrFile(*portFile, displayAddr); err != nil {
+			_ = ln.Close()
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		defer os.Remove(*portFile)
+	}
+	if *pidFile != "" {
+		if err := writeServePidFile(*pidFile); err != nil {
+			if ln != nil {
+				_ = ln.Close()
+			}
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		defer os.Remove(*pidFile)
+	}
+
+	fmt.Printf("reasonix serve — %s on http://%s\n", ctrl.Label(), displayAddr)
 	if srv.AuthMode() == "token" {
 		fmt.Printf("  auth: token\n")
-		fmt.Printf("  share: http://%s/?token=%s\n", *addr, srv.AuthToken())
+		// Under --port-file the process is supervised (e.g. remote bootstrap):
+		// stdout is redirected to a log, so printing the token here would leak it
+		// into a file readable by other same-machine users. The supervisor
+		// already holds the token (it wrote --token-file), so suppress the share
+		// URL and print only the token-file reference.
+		if *portFile != "" && *tokenFile != "" {
+			fmt.Printf("  share: http://%s/ (token in %s)\n", displayAddr, *tokenFile)
+		} else {
+			fmt.Printf("  share: http://%s/?token=%s\n", displayAddr, srv.AuthToken())
+		}
 	} else if srv.AuthMode() == "password" {
-		fmt.Printf("  auth: password (login at http://%s/login)\n", *addr)
+		fmt.Printf("  auth: password (login at http://%s/login)\n", displayAddr)
 	}
-	if warning := serve.PlainHTTPAuthWarning(serveCfg, *addr); warning != "" {
+	if warning := serve.PlainHTTPAuthWarning(serveCfg, displayAddr); warning != "" {
 		fmt.Fprintf(os.Stderr, "  %s\n", warning)
 	}
 	// Diagnostic: check whether balance endpoint is reachable
@@ -803,6 +896,13 @@ func runServe(args []string) int {
 	// Use graceful shutdown so SIGINT/SIGTERM drain active connections.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if ln != nil {
+		if err := srv.RunGracefulListener(ctx, ln); err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		return 0
+	}
 	if err := srv.RunGraceful(ctx, *addr); err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 1
@@ -1567,6 +1667,9 @@ func apiKeyEnvFromProviderName(name string) string {
 	if stem == "" {
 		return "CUSTOM_" + fnv1a32Hex(name) + "_API_KEY"
 	}
+	if stem[0] >= '0' && stem[0] <= '9' {
+		stem = "CUSTOM_" + stem
+	}
 	return stem + "_API_KEY"
 }
 
@@ -1902,9 +2005,6 @@ func providersWithMissingKeys(cfg *config.Config) []config.ProviderEntry {
 		cfg.Agent.PlannerModel,
 		cfg.Agent.SubagentModel,
 	}
-	if !strings.EqualFold(strings.TrimSpace(cfg.Agent.AutoPlan), "off") {
-		refs = append(refs, cfg.Agent.AutoPlanClassifier)
-	}
 	if len(cfg.Agent.SubagentModels) > 0 {
 		keys := make([]string, 0, len(cfg.Agent.SubagentModels))
 		for key := range cfg.Agent.SubagentModels {
@@ -2073,7 +2173,7 @@ func configCommand(args []string) int {
 	}
 	switch args[0] {
 	case "auto-plan":
-		return configAutoPlanCommand(args[1:])
+		return configAutoPlanCompatibilityCommand(args[1:])
 	case "reasoning-language":
 		return configReasoningLanguageCommand(args[1:])
 	default:
@@ -2082,9 +2182,12 @@ func configCommand(args []string) int {
 	}
 }
 
-func configAutoPlanCommand(args []string) int {
+// configAutoPlanCompatibilityCommand preserves the released shell interface
+// without restoring Automatic Plan Mode. Reading and writing "off" are safe
+// no-ops; every attempt to enable the retired feature is rejected.
+func configAutoPlanCompatibilityCommand(args []string) int {
 	fs := flag.NewFlagSet("config auto-plan", flag.ContinueOnError)
-	local := fs.Bool("local", false, "unsupported; auto-plan is user-level only")
+	local := fs.Bool("local", false, "unsupported; automatic plan mode is retired")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -2094,39 +2197,19 @@ func configAutoPlanCommand(args []string) int {
 	}
 	rest := fs.Args()
 	if len(rest) > 1 {
-		configAutoPlanUsage()
+		configAutoPlanCompatibilityUsage()
 		return 2
 	}
 	if len(rest) == 0 {
-		cfg, err := config.Load()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-			return 1
-		}
-		mode := cfg.Agent.AutoPlan
-		mode = cliAutoPlanMode(mode)
-		fmt.Printf("auto_plan = %q\n", mode)
+		fmt.Println(`auto_plan = "off"`)
 		return 0
 	}
-	path := config.UserConfigPath()
-	if path == "" {
-		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "cannot resolve config path")
-		return 1
-	}
-	// Serialize the load-modify-save against other in-process user-config
-	// editors so concurrent writers don't drop each other's fields.
-	unlock := config.LockUserConfigEdits()
-	defer unlock()
-	cfg := config.LoadForEdit(path)
+	cfg := config.Default()
 	if err := cfg.SetAutoPlan(rest[0]); err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 2
 	}
-	if err := cfg.SaveTo(path); err != nil {
-		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-		return 1
-	}
-	fmt.Printf("auto_plan = %q (%s)\n", cfg.Agent.AutoPlan, displayPath(path))
+	fmt.Println(`auto_plan = "off"`)
 	return 0
 }
 
@@ -2199,14 +2282,13 @@ func configReasoningLanguageCommand(args []string) int {
 
 func configUsage() {
 	fmt.Print(`Usage:
-  reasonix config auto-plan [off|on]
   reasonix config reasoning-language [--local] [auto|zh|en]
 `)
 }
 
-func configAutoPlanUsage() {
+func configAutoPlanCompatibilityUsage() {
 	fmt.Print(`Usage:
-  reasonix config auto-plan [off|on]
+  reasonix config auto-plan [off]
 `)
 }
 

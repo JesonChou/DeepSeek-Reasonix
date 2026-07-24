@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +22,9 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/i18n"
 	"reasonix/internal/provider"
+	"reasonix/internal/secrets"
 	"reasonix/internal/skill"
+	"reasonix/internal/testenv"
 )
 
 type blockingTurnRunner struct{ started chan struct{} }
@@ -34,9 +36,38 @@ type stubbornTurnRunner struct {
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
+const (
+	middleClickPasteHelperFlag = "GO_WANT_REASONIX_MIDDLE_CLICK_PASTE_HELPER"
+	middleClickPasteHelperMode = "REASONIX_MIDDLE_CLICK_PASTE_HELPER_MODE"
+	middleClickPasteTestValue  = "REASONIX_MIDDLE_CLICK_TEST_VALUE"
+)
+
+func TestMiddleClickPasteCommandHelper(t *testing.T) {
+	if os.Getenv(middleClickPasteHelperFlag) != "1" {
+		return
+	}
+	switch os.Getenv(middleClickPasteHelperMode) {
+	case "credential":
+		if value := os.Getenv(middleClickPasteTestValue); value != "" {
+			_, _ = fmt.Fprint(os.Stdout, value)
+		} else {
+			_, _ = fmt.Fprint(os.Stdout, "filtered")
+		}
+	case "newlines":
+		_, _ = fmt.Fprint(os.Stdout, "line\n\n")
+	default:
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
 func TestMain(m *testing.M) {
 	old := detectTermuxTerminal
 	detectTermuxTerminal = func() bool { return false }
+	cleanupUserState, err := testenv.IsolateUserState()
+	if err != nil {
+		panic(err)
+	}
 
 	// Pin the UI language for the whole cli test binary. Production code
 	// (cli.Run) calls i18n.DetectLanguage("") which resolves the host locale from
@@ -56,6 +87,7 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 	detectTermuxTerminal = old
+	cleanupUserState()
 	os.Exit(code)
 }
 
@@ -263,9 +295,9 @@ func TestCompletionMenuPadsWithNonBreakingSpaces(t *testing.T) {
 }
 
 // TestTranscriptViewportSizing proves the viewport tracks the terminal size and
-// gets the rows left over after the pinned bottom region (input box + two
-// information rows and their divider = 6 with an empty 1-line composer), and
-// is fed the committed transcript.
+// gets the rows left over after the pinned bottom region (input box + the one
+// available information row = 4 with an empty 1-line composer and no Git or
+// telemetry), and is fed the committed transcript.
 func TestTranscriptViewportSizing(t *testing.T) {
 	ctrl := control.New(control.Options{})
 	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
@@ -273,14 +305,14 @@ func TestTranscriptViewportSizing(t *testing.T) {
 	m0, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = m0.(chatTUI)
 
-	if got := m.bottomRows(); got != 6 {
-		t.Fatalf("bottomRows with an empty composer = %d, want 6 (input 1 + border 2 + status 3)", got)
+	if got := m.bottomRows(); got != 4 {
+		t.Fatalf("bottomRows with an empty composer = %d, want 4 (input 1 + border 2 + status 1)", got)
 	}
 	if m.viewport.Width() != 79 {
 		t.Errorf("viewport content width = %d, want 79 (terminal 80 - 1 scrollbar column)", m.viewport.Width())
 	}
-	if want := m.transcriptHeight(); m.viewport.Height() != want || want != 18 {
-		t.Errorf("viewport height = %d, transcriptHeight = %d, want 18 (24-6)", m.viewport.Height(), want)
+	if want := m.transcriptHeight(); m.viewport.Height() != want || want != 20 {
+		t.Errorf("viewport height = %d, transcriptHeight = %d, want 20 (24-4)", m.viewport.Height(), want)
 	}
 	if m.viewport.TotalLineCount() == 0 {
 		t.Errorf("viewport should hold the committed banner after the first resize")
@@ -519,8 +551,8 @@ func TestTranscriptResizeRerendersCommittedMarkdownAtNewWidth(t *testing.T) {
 			break
 		}
 	}
-	if got, want := ruleWidth, transcriptContentWidth(80, false); got != want {
-		t.Fatalf("resized thematic rule width = %d, want new transcript width %d", got, want)
+	if got, want := ruleWidth, transcriptContentWidth(80, false)-visibleWidth(assistantTranscriptIndent); got != want {
+		t.Fatalf("resized thematic rule width = %d, want indented assistant body width %d", got, want)
 	}
 	if newLines >= oldLines {
 		t.Fatalf("wider transcript kept old hard wrapping: old lines=%d new lines=%d\n%s", oldLines, newLines, newRendered)
@@ -553,15 +585,14 @@ func TestTranscriptResizeKeepsScrolledReaderOnSameBlock(t *testing.T) {
 	if m.viewport.AtBottom() {
 		t.Fatal("test reader anchor must be above the transcript bottom")
 	}
-	if top := ansi.Strip(m.wrappedLines[m.viewport.YOffset()]); !strings.Contains(top, "ANCHOR-1") {
-		t.Fatalf("test setup top row = %q, want ANCHOR-1", top)
-	}
 
 	m0, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
 	m = m0.(chatTUI)
-	top := ansi.Strip(m.wrappedLines[m.viewport.YOffset()])
-	if !strings.Contains(top, "ANCHOR-1") {
-		t.Fatalf("resize moved reader to another transcript block: top row %q", top)
+	newContentWidth := transcriptContentWidth(m.width, false)
+	newSecondBlockStart := transcriptBlockLineCount(m.transcript[0], newContentWidth)
+	newThirdBlockStart := newSecondBlockStart + transcriptBlockLineCount(m.transcript[1], newContentWidth)
+	if offset := m.viewport.YOffset(); offset < newSecondBlockStart || offset >= newThirdBlockStart {
+		t.Fatalf("resize moved reader outside ANCHOR-1 block: offset=%d block=[%d,%d)", offset, newSecondBlockStart, newThirdBlockStart)
 	}
 }
 
@@ -810,7 +841,7 @@ func TestMarkdownDividerFitsTranscriptContentWidth(t *testing.T) {
 	if m.viewport.Width() != wantW {
 		t.Fatalf("viewport width = %d, want transcript content width %d", m.viewport.Width(), wantW)
 	}
-	rule := strings.TrimRight(m.renderer.Render("---"), "\n")
+	rule := strings.TrimRight(newMarkdownRenderer(wantW).Render("---"), "\n")
 	lines := strings.Split(wrapTranscript(rule, m.viewport.Width()), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("markdown divider wrapped into %d lines at width %d: %q", len(lines), m.viewport.Width(), lines)
@@ -932,6 +963,11 @@ func TestApprovalChoicesPreserveDecisionSemantics(t *testing.T) {
 			tool: control.SandboxEscapeApprovalTool,
 			want: []approvalChoice{{allow: true}, {allow: true, allowForSession: true}, {}},
 		},
+		{
+			name: "plan decision",
+			tool: planApprovalTool,
+			want: []approvalChoice{{allow: true}, {}, {exitPlan: true}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -946,6 +982,129 @@ func TestApprovalChoicesPreserveDecisionSemantics(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	grantable := approvalChoices(&event.Approval{
+		Kind: "recovery", Recovery: &event.RecoveryApproval{CanGrantTask: true},
+	})
+	wantGrantable := []approvalChoice{{allow: true}, {allow: true, allowForSession: true}, {}}
+	if len(grantable) != len(wantGrantable) {
+		t.Fatalf("grantable recovery choices = %d, want %d", len(grantable), len(wantGrantable))
+	}
+	for i := range grantable {
+		grantable[i].label = ""
+		if grantable[i] != wantGrantable[i] {
+			t.Fatalf("grantable recovery choice %d = %+v, want %+v", i, grantable[i], wantGrantable[i])
+		}
+	}
+	labels := approvalChoiceLabels(&event.Approval{Kind: "recovery", Recovery: &event.RecoveryApproval{
+		CanGrantTask: true, TaskGrantScope: "git push origin → feature",
+	}})
+	if len(labels) != 3 || !strings.Contains(labels[1], "git push origin → feature") {
+		t.Fatalf("grantable recovery labels = %v", labels)
+	}
+	planLabels := approvalChoiceLabels(&event.Approval{Kind: "recovery", Recovery: &event.RecoveryApproval{
+		ChangeKind: "strategy",
+	}})
+	if len(planLabels) != 2 || planLabels[0] != "Adopt the new plan and continue" || planLabels[1] != "Do not adopt; let Auto adjust" {
+		t.Fatalf("plan-change recovery labels = %v", planLabels)
+	}
+	planApprovalLabels := approvalChoiceLabels(&event.Approval{Tool: planApprovalTool})
+	if len(planApprovalLabels) != 3 || planApprovalLabels[0] != "Start execution" ||
+		planApprovalLabels[1] != "Revise plan (keep planning)" || planApprovalLabels[2] != "Exit without executing" {
+		t.Fatalf("plan approval labels = %v", planApprovalLabels)
+	}
+}
+
+func TestPlanApprovalActionsSynchronizeTUIAndControllerMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		key      tea.KeyPressMsg
+		wantPlan bool
+	}{
+		{name: "start execution", key: tea.KeyPressMsg{Code: '1'}},
+		{name: "revise plan", key: tea.KeyPressMsg{Code: '2'}, wantPlan: true},
+		{name: "exit without executing", key: tea.KeyPressMsg{Code: '3'}},
+		{name: "legacy n keeps planning", key: tea.KeyPressMsg{Code: 'n'}, wantPlan: true},
+		{name: "escape keeps planning", key: tea.KeyPressMsg{Code: tea.KeyEscape}, wantPlan: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := control.New(control.Options{})
+			t.Cleanup(ctrl.Close)
+			m := newTestChatTUI()
+			m.ctrl = ctrl
+			m.planMode = true
+			m.ctrl.SetPlanMode(true)
+			m.pendingApproval = &event.Approval{ID: "plan", Tool: planApprovalTool}
+
+			next, _ := m.handleApprovalKey(tt.key)
+			m = next.(chatTUI)
+			if m.pendingApproval != nil {
+				t.Fatal("plan approval was not resolved")
+			}
+			if m.planMode != tt.wantPlan || m.ctrl.PlanMode() != tt.wantPlan {
+				t.Fatalf("plan mode = tui %v/controller %v, want %v", m.planMode, m.ctrl.PlanMode(), tt.wantPlan)
+			}
+		})
+	}
+}
+
+func TestPlanApprovalBannerShowsThreeExplicitActions(t *testing.T) {
+	m := newTestChatTUI()
+	m.width = 120
+	m.pendingApproval = &event.Approval{ID: "plan", Tool: planApprovalTool}
+	banner := ansi.Strip(m.renderApprovalBanner())
+	for _, want := range []string{"Start execution", "Revise plan (keep planning)", "Exit without executing"} {
+		if !strings.Contains(banner, want) {
+			t.Fatalf("plan approval banner missing %q:\n%s", want, banner)
+		}
+	}
+}
+
+func TestPlanChangeApprovalBannerUsesNeutralCopyAndShowsPlans(t *testing.T) {
+	m := newTestChatTUI()
+	m.width = 120
+	m.pendingApproval = &event.Approval{
+		ID: "plan-change", Tool: "todo_write", Reason: "choose the public API direction", Kind: "recovery",
+		Recovery: &event.RecoveryApproval{
+			ChangeKind: "scope", PlanBefore: "1. Keep API [in_progress]", PlanAfter: "1. Replace API [in_progress]",
+		},
+	}
+	banner := ansi.Strip(m.renderApprovalBanner())
+	for _, want := range []string{"The execution plan needs your decision", "Previous plan: 1. Keep API", "Proposed plan: 1. Replace API"} {
+		if !strings.Contains(banner, want) {
+			t.Fatalf("plan-change banner missing %q:\n%s", want, banner)
+		}
+	}
+}
+
+func TestPlanChangeApprovalStartsWithoutSelection(t *testing.T) {
+	m := newTestChatTUI()
+	m.ingestEvent(event.Event{
+		Kind: event.ApprovalRequest,
+		Approval: event.Approval{
+			ID: "plan-change", Tool: "todo_write", Kind: "recovery",
+			Recovery: &event.RecoveryApproval{ChangeKind: "strategy"},
+		},
+	})
+	if m.approvalSelection != -1 {
+		t.Fatalf("plan approval selection = %d, want no default", m.approvalSelection)
+	}
+	banner := ansi.Strip(m.renderApprovalBanner())
+	if strings.Contains(banner, "❯ 1.") || strings.Contains(banner, "❯ 2.") {
+		t.Fatalf("plan approval banner preselected a choice:\n%s", banner)
+	}
+
+	next, _ := m.handleApprovalKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = next.(chatTUI)
+	if m.pendingApproval == nil {
+		t.Fatal("Enter without a selection resolved the plan decision")
+	}
+	next, _ = m.handleApprovalKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = next.(chatTUI)
+	if m.approvalSelection != 0 {
+		t.Fatalf("first navigation selected %d, want first choice", m.approvalSelection)
 	}
 }
 
@@ -1206,6 +1365,51 @@ func TestUnsendDiscardsBufferedEvents(t *testing.T) {
 	}
 }
 
+func TestRecoveryPauseTurnDoneIsInformational(t *testing.T) {
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+	const backendFallback = "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send \"continue\" to start a fresh attempt, or add instructions to change direction."
+	tests := []struct {
+		lang string
+		want string
+	}{
+		{
+			lang: "en",
+			want: "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send “Continue” to start a fresh attempt, or add instructions to change direction.",
+		},
+		{
+			lang: "zh",
+			want: "已暂停自动重试。Reasonix 已停止重复尝试，并保留已完成的工作。发送“继续”即可开始新一轮，也可以补充要求来调整方向。",
+		},
+		{
+			lang: "zh-TW",
+			want: "已暫停自動重試。Reasonix 已停止重複嘗試，並保留已完成的工作。傳送「繼續」即可開始新一輪，也可以補充要求來調整方向。",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.lang, func(t *testing.T) {
+			i18n.DetectLanguage(tt.lang)
+			m := newTestChatTUI()
+			m.width = 240
+			m.ingestEvent(event.Event{
+				Kind:    event.TurnDone,
+				Err:     &agent.RecoveryPauseError{Message: backendFallback},
+				Outcome: event.TurnOutcomeRecoveryPaused,
+			})
+
+			got := ansi.Strip(strings.Join(*m.pendingCommit, "\n"))
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("recovery pause transcript = %q, want localized pause message %q", got, tt.want)
+			}
+			if tt.lang != "en" && strings.Contains(got, backendFallback) {
+				t.Fatalf("recovery pause transcript = %q, must not leak English fallback into %s", got, tt.lang)
+			}
+			if strings.Contains(got, i18n.M.ErrorPrefix) {
+				t.Fatalf("recovery pause transcript = %q, must not use error prefix %q", got, i18n.M.ErrorPrefix)
+			}
+		})
+	}
+}
+
 // TestAnswerTextStartingWithBracketStaysInAnswer locks in the win of the typed
 // event stream: model answer text starting with "[" — a markdown link, a slice
 // literal, even a quoted "[… · planning]" — is a Text event, so it can never be
@@ -1430,12 +1634,328 @@ func clipboardCopyResultFromCmd(t *testing.T, cmd tea.Cmd) clipboardCopyMsg {
 	return clipboardCopyMsg{}
 }
 
+func clipboardTextPasteResultFromCmd(t *testing.T, cmd tea.Cmd) clipboardTextPasteMsg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected clipboard paste command")
+	}
+	msg := cmd()
+	switch msg := msg.(type) {
+	case clipboardTextPasteMsg:
+		return msg
+	case tea.BatchMsg:
+		for _, child := range msg {
+			if child == nil {
+				continue
+			}
+			childMsg := child()
+			if result, ok := childMsg.(clipboardTextPasteMsg); ok {
+				return result
+			}
+		}
+	}
+	t.Fatalf("clipboard paste command returned %T, want clipboardTextPasteMsg", msg)
+	return clipboardTextPasteMsg{}
+}
+
+func middleClickPasteResultFromCmd(t *testing.T, cmd tea.Cmd) tea.PasteMsg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected middle-click paste command")
+	}
+	msg := cmd()
+	switch msg := msg.(type) {
+	case tea.PasteMsg:
+		return msg
+	case tea.BatchMsg:
+		for _, child := range msg {
+			if child == nil {
+				continue
+			}
+			if result, ok := child().(tea.PasteMsg); ok {
+				return result
+			}
+		}
+	}
+	t.Fatalf("middle-click command returned %T, want tea.PasteMsg", msg)
+	return tea.PasteMsg{}
+}
+
+func setLocalClipboardSession(t *testing.T) {
+	t.Helper()
+	t.Setenv("SSH_CONNECTION", "")
+	t.Setenv("SSH_CLIENT", "")
+	t.Setenv("SSH_TTY", "")
+}
+
+func TestMouseRightClickWithoutSelectionPastesClipboardText(t *testing.T) {
+	setLocalClipboardSession(t)
+	m := newComposerMouseTestTUI(t, 60, 16)
+	m.input.SetValue("before ")
+
+	previous := readNativeClipboardText
+	t.Cleanup(func() { readNativeClipboardText = previous })
+	readNativeClipboardText = func() (string, error) { return "pasted text", nil }
+
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseRight})
+	m = next.(chatTUI)
+	result := clipboardTextPasteResultFromCmd(t, cmd)
+	next, _ = m.Update(result)
+	m = next.(chatTUI)
+
+	if got := m.input.Value(); got != "before pasted text" {
+		t.Fatalf("right-click paste produced %q, want %q", got, "before pasted text")
+	}
+}
+
+func TestMouseRightClickPasteOverSSHDoesNotReadRemoteClipboard(t *testing.T) {
+	t.Setenv("SSH_CONNECTION", "host 22 client 1234")
+	t.Setenv("SSH_CLIENT", "")
+	t.Setenv("SSH_TTY", "")
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	m.input.SetValue("before ")
+
+	previous := readNativeClipboardText
+	t.Cleanup(func() { readNativeClipboardText = previous })
+	readNativeClipboardText = func() (string, error) {
+		t.Fatal("SSH right-click paste must not read the remote host clipboard")
+		return "", nil
+	}
+
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseRight})
+	m = next.(chatTUI)
+	result := clipboardTextPasteResultFromCmd(t, cmd)
+	if !result.remote {
+		t.Fatalf("SSH right-click paste result = %+v, want remote hint", result)
+	}
+
+	next, _ = m.Update(result)
+	m = next.(chatTUI)
+	if got := m.input.Value(); got != "before " {
+		t.Fatalf("SSH right-click paste changed composer to %q", got)
+	}
+	if got := strings.Join(m.transcript, "\n"); !strings.Contains(got, i18n.M.ClipboardTextPasteRemoteHint) {
+		t.Fatalf("SSH right-click paste notice = %q, want %q", got, i18n.M.ClipboardTextPasteRemoteHint)
+	}
+}
+
+func TestMouseRightClickPasteUsesCanonicalFoldedPastePath(t *testing.T) {
+	setLocalClipboardSession(t)
+	m := newComposerMouseTestTUI(t, 60, 16)
+	pasted := "one\ntwo\nthree\nfour\nfive"
+
+	previous := readNativeClipboardText
+	t.Cleanup(func() { readNativeClipboardText = previous })
+	readNativeClipboardText = func() (string, error) { return pasted, nil }
+
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseRight})
+	m = next.(chatTUI)
+	result := clipboardTextPasteResultFromCmd(t, cmd)
+	next, _ = m.Update(result)
+	m = next.(chatTUI)
+
+	if got := m.input.Value(); got != "[Pasted text #1 · 5 lines] " {
+		t.Fatalf("right-click folded paste display = %q", got)
+	}
+	if len(m.pastedBlocks) != 1 || m.pastedBlocks[0].text != pasted {
+		t.Fatalf("right-click folded paste block = %+v", m.pastedBlocks)
+	}
+}
+
+func TestMiddleClickUsesTmuxPasteBufferInsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	previousTmux := readTmuxPasteBuffer
+	previousPrimary := readPrimaryPasteSelection
+	t.Cleanup(func() {
+		readTmuxPasteBuffer = previousTmux
+		readPrimaryPasteSelection = previousPrimary
+	})
+	readTmuxPasteBuffer = func() (string, error) { return "tmux buffer", nil }
+	readPrimaryPasteSelection = func() (string, error) {
+		t.Fatal("middle-click inside tmux must not read the desktop PRIMARY selection")
+		return "", nil
+	}
+
+	msg := pasteMiddleClick()()
+	paste, ok := msg.(tea.PasteMsg)
+	if !ok || paste.Content != "tmux buffer" {
+		t.Fatalf("middle-click result = %#v, want tmux-buffer PasteMsg", msg)
+	}
+}
+
+func TestMouseMiddleClickPastesPrimarySelectionThroughCanonicalPath(t *testing.T) {
+	setLocalClipboardSession(t)
+	t.Setenv("TMUX", "")
+	previous := readPrimaryPasteSelection
+	t.Cleanup(func() { readPrimaryPasteSelection = previous })
+	readPrimaryPasteSelection = func() (string, error) { return "primary selection", nil }
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	m.input.SetValue("before ")
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseMiddle})
+	m = next.(chatTUI)
+	paste := middleClickPasteResultFromCmd(t, cmd)
+	next, _ = m.Update(paste)
+	m = next.(chatTUI)
+
+	if got := m.input.Value(); got != "before primary selection" {
+		t.Fatalf("middle-click paste produced %q, want %q", got, "before primary selection")
+	}
+}
+
+func TestMouseMiddleClickDoesNotMutateHiddenComposer(t *testing.T) {
+	setLocalClipboardSession(t)
+	t.Setenv("TMUX", "")
+	previous := readPrimaryPasteSelection
+	t.Cleanup(func() { readPrimaryPasteSelection = previous })
+	readPrimaryPasteSelection = func() (string, error) {
+		t.Fatal("middle-click with a hidden composer must not read PRIMARY")
+		return "", nil
+	}
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	m.input.SetValue("before")
+	m.pendingApproval = &event.Approval{ID: "approval", Tool: "bash", Subject: "echo hi"}
+	if !m.hideComposer() {
+		t.Fatal("test setup did not hide composer")
+	}
+
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseMiddle})
+	m = next.(chatTUI)
+	if cmd != nil {
+		t.Fatalf("hidden-composer middle-click returned command with message %#v", cmd())
+	}
+	if got := m.input.Value(); got != "before" {
+		t.Fatalf("hidden composer changed to %q", got)
+	}
+}
+
+func TestMouseMiddleClickPasteOverSSHDoesNotReadRemotePrimary(t *testing.T) {
+	t.Setenv("SSH_CONNECTION", "host 22 client 1234")
+	t.Setenv("SSH_CLIENT", "")
+	t.Setenv("SSH_TTY", "")
+	t.Setenv("TMUX", "")
+	previous := readPrimaryPasteSelection
+	t.Cleanup(func() { readPrimaryPasteSelection = previous })
+	readPrimaryPasteSelection = func() (string, error) {
+		t.Fatal("SSH middle-click must not read PRIMARY on the remote host")
+		return "", nil
+	}
+
+	m := newComposerMouseTestTUI(t, 60, 16)
+	next, cmd := m.Update(tea.MouseClickMsg{Button: tea.MouseMiddle})
+	m = next.(chatTUI)
+	result := clipboardTextPasteResultFromCmd(t, cmd)
+	if !result.remote {
+		t.Fatalf("SSH middle-click paste result = %+v, want remote hint", result)
+	}
+
+	next, _ = m.Update(result)
+	m = next.(chatTUI)
+	if got := strings.Join(m.transcript, "\n"); !strings.Contains(got, i18n.M.ClipboardTextPasteRemoteHint) {
+		t.Fatalf("SSH middle-click paste notice = %q, want %q", got, i18n.M.ClipboardTextPasteRemoteHint)
+	}
+}
+
+func TestMiddleClickUsesPrimarySelectionOutsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "")
+	previousTmux := readTmuxPasteBuffer
+	previousPrimary := readPrimaryPasteSelection
+	t.Cleanup(func() {
+		readTmuxPasteBuffer = previousTmux
+		readPrimaryPasteSelection = previousPrimary
+	})
+	readTmuxPasteBuffer = func() (string, error) {
+		t.Fatal("middle-click outside tmux must not read a tmux buffer")
+		return "", nil
+	}
+	readPrimaryPasteSelection = func() (string, error) { return "primary selection", nil }
+
+	msg := pasteMiddleClick()()
+	paste, ok := msg.(tea.PasteMsg)
+	if !ok || paste.Content != "primary selection" {
+		t.Fatalf("middle-click result = %#v, want PRIMARY-selection PasteMsg", msg)
+	}
+}
+
+func TestMiddleClickTmuxReadFailureIsSilent(t *testing.T) {
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	previous := readTmuxPasteBuffer
+	t.Cleanup(func() { readTmuxPasteBuffer = previous })
+	readTmuxPasteBuffer = func() (string, error) { return "", errors.New("no buffers") }
+
+	if msg := pasteMiddleClick()(); msg != nil {
+		t.Fatalf("failed tmux-buffer read returned %#v, want silent no-op", msg)
+	}
+}
+
+func TestMiddleClickPasteCommandsFilterRegisteredCredentials(t *testing.T) {
+	t.Setenv(middleClickPasteHelperFlag, "1")
+	t.Setenv(middleClickPasteHelperMode, "credential")
+	t.Setenv(middleClickPasteTestValue, "credential-leaked")
+	secrets.RegisterCredentialEnvKeys([]string{middleClickPasteTestValue})
+
+	previous := newPasteCommand
+	t.Cleanup(func() { newPasteCommand = previous })
+	newPasteCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command(os.Args[0], "-test.run=^TestMiddleClickPasteCommandHelper$")
+	}
+
+	for name, read := range map[string]func() (string, error){
+		"tmux":    readTmuxBuffer,
+		"primary": readPrimarySelection,
+	} {
+		t.Run(name, func(t *testing.T) {
+			text, err := read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if text != "filtered" {
+				t.Fatalf("paste helper inherited registered credential: %q", text)
+			}
+		})
+	}
+}
+
+func TestReadPrimarySelectionRequestsTextAndPreservesNewlines(t *testing.T) {
+	t.Setenv(middleClickPasteHelperFlag, "1")
+	t.Setenv(middleClickPasteHelperMode, "newlines")
+
+	previous := newPasteCommand
+	t.Cleanup(func() { newPasteCommand = previous })
+	called := false
+	newPasteCommand = func(name string, args ...string) *exec.Cmd {
+		called = true
+		if name != "wl-paste" {
+			t.Fatalf("first PRIMARY helper = %q, want wl-paste", name)
+		}
+		want := []string{"--primary", "--type", "text", "--no-newline"}
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("wl-paste args = %q, want %q", args, want)
+		}
+		return exec.Command(os.Args[0], "-test.run=^TestMiddleClickPasteCommandHelper$")
+	}
+
+	text, err := readPrimarySelection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("PRIMARY helper was not invoked")
+	}
+	if text != "line\n\n" {
+		t.Fatalf("PRIMARY selection = %q, want trailing newlines preserved", text)
+	}
+}
+
 // TestMouseDragReleaseAutoCopies verifies that releasing the mouse after a
 // left-drag over the transcript copies the selection to the clipboard
 // automatically (native terminal convention), keeps the selection highlighted
 // so a follow-up right-click can still re-copy it, and arms the transient
 // "copied to clipboard" status-line notice.
 func TestMouseDragReleaseAutoCopies(t *testing.T) {
+	setLocalClipboardSession(t)
 	m := newTestChatTUI()
 	m.transcript = []string{"hello world"}
 	m.wrappedLines = []string{"hello world"}
@@ -1698,65 +2218,6 @@ func TestEffortCommandAutoClearsProviderEffort(t *testing.T) {
 	section := providerSection(string(body), "deepseek-flash")
 	if strings.Contains(section, `effort      = "`) {
 		t.Fatalf("auto should clear saved deepseek-flash effort:\n%s", section)
-	}
-}
-
-func TestAutoPlanCommandPersistsAndUpdatesController(t *testing.T) {
-	isolateUserConfig(t)
-
-	runner := &recordingTurnRunner{}
-	events := make(chan event.Event, 4)
-	ctrl := control.New(control.Options{
-		AutoPlan: "off",
-		Runner:   runner,
-		Sink: event.FuncSink(func(e event.Event) {
-			events <- e
-		}),
-	})
-	m := newTestChatTUI()
-	m.ctrl = ctrl
-
-	m.runAutoPlanCommand("/auto-plan on")
-
-	body, err := os.ReadFile(config.UserConfigPath())
-	if err != nil {
-		t.Fatalf("read saved config: %v", err)
-	}
-	if !strings.Contains(string(body), `auto_plan   = "on"`) {
-		t.Fatalf("saved config missing auto_plan=on:\n%s", body)
-	}
-	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
-	ctrl.Send(input)
-	waitForCLIEvent(t, events, event.TurnDone)
-	if len(runner.inputs) != 1 || !strings.HasPrefix(agent.StripTransientUserBlocks(runner.inputs[0]), control.PlanModeMarker) {
-		t.Fatalf("/auto-plan on should affect current controller, inputs=%q", runner.inputs)
-	}
-}
-
-func TestAutoPlanCommandWritesUserConfigNotProjectConfig(t *testing.T) {
-	isolateUserConfig(t)
-	projectPath := filepath.Join(mustGetwd(t), "reasonix.toml")
-	if err := os.WriteFile(projectPath, []byte("[agent]\nauto_plan = \"off\"\n"), 0o644); err != nil {
-		t.Fatalf("write project config: %v", err)
-	}
-
-	m := newTestChatTUI()
-	m.ctrl = control.New(control.Options{AutoPlan: "off"})
-	m.runAutoPlanCommand("/auto-plan on")
-
-	userBody, err := os.ReadFile(config.UserConfigPath())
-	if err != nil {
-		t.Fatalf("read user config: %v", err)
-	}
-	if !strings.Contains(string(userBody), `auto_plan   = "on"`) {
-		t.Fatalf("user config missing auto_plan=on:\n%s", userBody)
-	}
-	projectBody, err := os.ReadFile(projectPath)
-	if err != nil {
-		t.Fatalf("read project config: %v", err)
-	}
-	if string(projectBody) != "[agent]\nauto_plan = \"off\"\n" {
-		t.Fatalf("/auto-plan should not rewrite project config:\n%s", projectBody)
 	}
 }
 
@@ -2627,6 +3088,33 @@ func TestPasteFoldExpandOnSubmit(t *testing.T) {
 	}
 }
 
+func TestStrongResearchPromptStaysInOrdinaryMode(t *testing.T) {
+	r := &recordingTurnRunner{}
+	events := make(chan event.Event, 8)
+	ctrl := control.New(control.Options{
+		Runner: r,
+		Sink:   event.FuncSink(func(e event.Event) { events <- e }),
+	})
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	input := "持续排查这个线上卡顿直到根因明确，并验证修复"
+	m.input.SetValue(input)
+
+	model, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = model.(chatTUI)
+	waitForCLIEvent(t, events, event.TurnDone)
+
+	if len(r.inputs) != 1 || !strings.HasSuffix(r.inputs[0], input) {
+		t.Fatalf("ordinary prompt was not sent unchanged at the user boundary: %q", r.inputs)
+	}
+	if strings.Contains(r.inputs[0], "<active-goal>") || strings.Contains(r.inputs[0], "AutoResearch protocol") {
+		t.Fatalf("ordinary TUI prompt should not enter Goal or AutoResearch:\n%s", r.inputs[0])
+	}
+	if ctrl.GoalStatus() != control.GoalStatusStopped {
+		t.Fatalf("GoalStatus() = %q, want stopped", ctrl.GoalStatus())
+	}
+}
+
 func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
 	for _, input := range []string{
 		"// explain this",
@@ -2636,9 +3124,8 @@ func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
 			r := &recordingTurnRunner{}
 			events := make(chan event.Event, 8)
 			ctrl := control.New(control.Options{
-				AutoPlan: "off",
-				Runner:   r,
-				Sink:     event.FuncSink(func(e event.Event) { events <- e }),
+				Runner: r,
+				Sink:   event.FuncSink(func(e event.Event) { events <- e }),
 			})
 			m := newTestChatTUI()
 			m.ctrl = ctrl
@@ -2658,9 +3145,8 @@ func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
 func TestUnknownSlashCommandDoesNotStartTurn(t *testing.T) {
 	r := &recordingTurnRunner{}
 	ctrl := control.New(control.Options{
-		AutoPlan: "off",
-		Runner:   r,
-		Sink:     event.FuncSink(func(event.Event) {}),
+		Runner: r,
+		Sink:   event.FuncSink(func(event.Event) {}),
 	})
 	m := newTestChatTUI()
 	m.ctrl = ctrl
@@ -2988,14 +3474,6 @@ func TestCtrlZResetsMouseTrackingBeforeSuspend(t *testing.T) {
 	ctrlZ := tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl}
 
 	_, cmd := m.Update(ctrlZ)
-	if runtime.GOOS == "windows" {
-		// On Windows Ctrl+Z triggers undo (no-op when undo stack is empty).
-		// finalize with no cmds returns nil.
-		if cmd != nil {
-			t.Fatalf("expected no command from Ctrl+Z on Windows with empty undo, got %T", cmd)
-		}
-		return
-	}
 	if cmd == nil {
 		t.Fatal("expected Ctrl+Z to return a suspend sequence")
 	}

@@ -205,6 +205,37 @@ func TestDesktopLayoutStyleNormalizes(t *testing.T) {
 	}
 }
 
+func TestDesktopConversationWidthNormalizes(t *testing.T) {
+	if got := Default().DesktopConversationWidth(); got != "standard" {
+		t.Fatalf("default desktop conversation width = %q, want standard", got)
+	}
+
+	for _, tt := range []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"", "standard", false},
+		{"standard", "standard", false},
+		{" FULL ", "full", false},
+		{"wide", "standard", true},
+	} {
+		c := Default()
+		if err := c.SetDesktopConversationWidth(tt.in); (err != nil) != tt.wantErr {
+			t.Fatalf("SetDesktopConversationWidth(%q) err = %v, wantErr %v", tt.in, err, tt.wantErr)
+		}
+		if got := c.DesktopConversationWidth(); got != tt.want {
+			t.Fatalf("DesktopConversationWidth(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+
+	c := Default()
+	c.Desktop.ConversationWidth = " FULL "
+	if got := c.DesktopConversationWidth(); got != "full" {
+		t.Fatalf("manually edited conversation width = %q, want full", got)
+	}
+}
+
 func TestDesktopExternalOpenerValidation(t *testing.T) {
 	c := Default()
 	if got := c.DesktopExternalOpener(); got != "" {
@@ -343,24 +374,18 @@ func TestSetPlannerModel(t *testing.T) {
 	}
 }
 
-func TestSetAutoPlan(t *testing.T) {
+func TestSetAutoPlanRejectsRetiredModes(t *testing.T) {
 	c := Default()
-	for _, mode := range []string{"on", "off"} {
-		if err := c.SetAutoPlan(mode); err != nil {
-			t.Fatalf("SetAutoPlan(%q): %v", mode, err)
+	if err := c.SetAutoPlan("off"); err != nil {
+		t.Fatalf("SetAutoPlan(off): %v", err)
+	}
+	if c.Agent.AutoPlan != "off" || c.Agent.AutoPlanClassifier != "" {
+		t.Fatalf("retired auto-plan state = (%q, %q), want off/empty", c.Agent.AutoPlan, c.Agent.AutoPlanClassifier)
+	}
+	for _, mode := range []string{"on", "ask", "auto"} {
+		if err := c.SetAutoPlan(mode); err == nil || !strings.Contains(err.Error(), "retired") {
+			t.Fatalf("SetAutoPlan(%q) err = %v, want retired error", mode, err)
 		}
-		if c.Agent.AutoPlan != mode {
-			t.Fatalf("auto_plan = %q, want %q", c.Agent.AutoPlan, mode)
-		}
-	}
-	if err := c.SetAutoPlan("ask"); err != nil {
-		t.Fatalf("legacy ask should be accepted: %v", err)
-	}
-	if c.Agent.AutoPlan != "on" {
-		t.Fatalf("legacy ask should save as on, got %q", c.Agent.AutoPlan)
-	}
-	if err := c.SetAutoPlan("auto"); err == nil {
-		t.Fatal("expected error for invalid auto_plan mode")
 	}
 }
 
@@ -692,6 +717,7 @@ func TestResolveModelAppliesModelOverrides(t *testing.T) {
 		BaseURL:           "https://proxy.example.com/v1",
 		Models:            []string{"deepseek-v4-flash", "plain-chat"},
 		Default:           "plain-chat",
+		ContextWindow:     131_072,
 		ReasoningProtocol: ReasoningProtocolOpenAI,
 		SupportedEfforts:  []string{"low", "medium", "high"},
 		ModelOverrides: map[string]ProviderModelOverride{
@@ -700,6 +726,7 @@ func TestResolveModelAppliesModelOverrides(t *testing.T) {
 				SupportedEfforts:  []string{"high", "max"},
 				DefaultEffort:     "max",
 				Vision:            &visionOff,
+				ContextWindow:     1_000_000,
 			},
 		},
 	}}}
@@ -718,6 +745,9 @@ func TestResolveModelAppliesModelOverrides(t *testing.T) {
 	if EffectiveVision(deepseek) {
 		t.Fatalf("vision override false should disable image input")
 	}
+	if deepseek.ContextWindow != 1_000_000 {
+		t.Fatalf("deepseek context window = %d, want per-model override", deepseek.ContextWindow)
+	}
 
 	plain, ok := c.ResolveModel("gateway/plain-chat")
 	if !ok {
@@ -725,6 +755,9 @@ func TestResolveModelAppliesModelOverrides(t *testing.T) {
 	}
 	if protocol := ReasoningProtocolForEntry(plain); protocol != ReasoningProtocolOpenAI {
 		t.Fatalf("plain protocol = %q, want provider-level openai", protocol)
+	}
+	if plain.ContextWindow != 131_072 {
+		t.Fatalf("plain context window = %d, want inherited provider value", plain.ContextWindow)
 	}
 }
 
@@ -903,16 +936,6 @@ func TestPluginMutators(t *testing.T) {
 	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", ToolTimeoutSeconds: map[string]int{" ": 1}}); err == nil {
 		t.Error("empty tool_timeout_seconds key should error")
 	}
-	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", DefaultToolsApprovalMode: "always"}); err == nil {
-		t.Error("invalid MCP approval mode should error")
-	}
-	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", Tools: map[string]MCPToolPolicy{"wipe": {ApprovalMode: "sometimes"}}}); err == nil {
-		t.Error("invalid per-tool MCP approval mode should error")
-	}
-	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", ApprovalsReviewer: "nobody"}); err == nil {
-		t.Error("invalid MCP approvals reviewer should error")
-	}
-
 	// Replace in place.
 	if err := c.UpsertPlugin(PluginEntry{Name: "ex", Command: "other-cmd"}); err != nil {
 		t.Fatalf("replace: %v", err)
@@ -1074,14 +1097,57 @@ func TestSaveToRoundTrips(t *testing.T) {
 	}
 }
 
+func TestRecoveryReviewerSettingsRoundTripThroughUserSave(t *testing.T) {
+	isolateUserConfigHome(t)
+	c := Default()
+	c.Agent.RecoveryModel = "deepseek-pro"
+	c.Agent.RecoveryTemperature = 0.25
+
+	path := UserConfigPath()
+	if err := c.SaveTo(path); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	got := LoadForEdit(path)
+	if got.Agent.RecoveryModel != "deepseek-pro" || got.Agent.RecoveryTemperature != 0 {
+		t.Fatalf("agent recovery settings not preserved: %+v", got.Agent)
+	}
+}
+
+func TestRetiredAutoGuardKeysAreIgnoredAndRemovedOnSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reasonix.toml")
+	if err := os.WriteFile(path, []byte("[desktop]\ndefault_auto_recovery_checkpoint = false\n\n[agent]\nauto_recovery_checkpoint = \"off\"\nrecovery_model = \"deepseek-pro\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := LoadForEdit(path)
+	if c.Agent.RecoveryModel != "deepseek-pro" {
+		t.Fatalf("unrelated recovery model was not loaded: %+v", c.Agent)
+	}
+	if err := c.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if strings.Contains(text, "default_auto_recovery_checkpoint") || strings.Contains(text, "auto_recovery_checkpoint") {
+		t.Fatalf("retired Auto Guard keys survived save:\n%s", text)
+	}
+	if !strings.Contains(text, `recovery_model = "deepseek-pro"`) {
+		t.Fatalf("save removed unrelated recovery model:\n%s", text)
+	}
+}
+
 func TestSaveToScopesUserAndProjectFiles(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home := isolateUserConfigHome(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
 	c := Default()
 	c.Desktop.Theme = "dark"
 	c.Desktop.ThemeStyle = "graphite"
 	c.Desktop.CloseBehavior = "background"
 
 	userPath := UserConfigPath()
+	requireTestPathWithin(t, home, userPath)
 	if err := c.SaveTo(userPath); err != nil {
 		t.Fatalf("SaveTo user config: %v", err)
 	}
@@ -1750,6 +1816,169 @@ func TestSaveToExistingProjectPersistsProviderAccessWithoutReplacingDesktopSecti
 	}
 	if !strings.Contains(string(body), "provider_access = []") {
 		t.Fatalf("explicit empty project provider access was not persisted:\n%s", body)
+	}
+}
+
+func TestWritePermissionsAllowUpdatesOnlyAllow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reasonix.toml")
+	original := `[permissions]
+# Keep the policy rationale.
+mode = "deny"
+allow = [
+  # Keep the list rationale.
+  "Bash(existing)", # Keep the existing rule rationale.
+] # Keep the allow rationale.
+ask = ["Edit(*.env)"]
+deny = ["Bash(rm:*)"]
+future_policy = "keep"
+
+[desktop]
+legacy_preference = "keep"
+`
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePermissionsAllow(path, []string{"Bash(existing)", "Edit(src/app.go)"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadForEditReadOnlyStrict(path)
+	if err != nil {
+		t.Fatalf("updated config does not parse: %v", err)
+	}
+	if !reflect.DeepEqual(got.Permissions.Allow, []string{"Bash(existing)", "Edit(src/app.go)"}) {
+		t.Fatalf("permissions.allow = %v", got.Permissions.Allow)
+	}
+	if got.Permissions.Mode != "deny" || !reflect.DeepEqual(got.Permissions.Ask, []string{"Edit(*.env)"}) || !reflect.DeepEqual(got.Permissions.Deny, []string{"Bash(rm:*)"}) {
+		t.Fatalf("permission policy changed: %+v", got.Permissions)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	for _, want := range []string{
+		"# Keep the policy rationale.",
+		"# Keep the list rationale.",
+		"# Keep the existing rule rationale.",
+		"# Keep the allow rationale.",
+		`future_policy = "keep"`,
+		"[desktop]\nlegacy_preference = \"keep\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("updated config missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestWritePermissionsAllowIgnoresSectionExamplesInMultilineStrings(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "multiline basic string with five-quote close before existing section",
+			body: `[agent]
+system_prompt = """
+Example only:
+A "quoted" explanation and an escaped \" marker.
+[permissions]
+allow = ["Bash(example)"]
+Ends with two quotes."""""
+
+[permissions]
+mode = "ask"
+allow = ["Bash(existing)"]
+deny = ["Bash(rm:*)"]
+`,
+		},
+		{
+			name: "multiline literal string with four-quote close without existing section",
+			body: `[agent]
+system_prompt = '''
+Example only:
+A 'quoted' explanation.
+[permissions]
+allow = ["Bash(example)"]
+Ends with one quote.''''
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "reasonix.toml")
+			if err := os.WriteFile(path, []byte(tt.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			wantAllow := []string{"Bash(existing)", "Edit(src/app.go)"}
+			if !strings.Contains(tt.body, `Bash(existing)`) {
+				wantAllow = []string{"Edit(src/app.go)"}
+			}
+			if err := WritePermissionsAllow(path, wantAllow); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := LoadForEditReadOnlyStrict(path)
+			if err != nil {
+				t.Fatalf("updated config does not parse: %v", err)
+			}
+			if !reflect.DeepEqual(got.Permissions.Allow, wantAllow) {
+				t.Fatalf("permissions.allow = %v, want %v", got.Permissions.Allow, wantAllow)
+			}
+			if !strings.Contains(got.Agent.SystemPrompt, "[permissions]\nallow = [\"Bash(example)\"]") {
+				t.Fatalf("system prompt example changed: %q", got.Agent.SystemPrompt)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), "[permissions]\nallow = [\"Bash(example)\"]") {
+				t.Fatalf("multiline string content changed:\n%s", raw)
+			}
+		})
+	}
+}
+
+func TestWritePermissionsAllowReplacesArrayContainingMultilineString(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reasonix.toml")
+	original := `[permissions]
+allow = [
+  """Bash(example]
+[desktop]
+)""",
+  "Bash(existing)",
+]
+deny = ["Bash(rm:*)"]
+
+[desktop]
+legacy_preference = "keep"
+`
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wantAllow := []string{"Bash(existing)", "Edit(src/app.go)"}
+	if err := WritePermissionsAllow(path, wantAllow); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadForEditReadOnlyStrict(path)
+	if err != nil {
+		t.Fatalf("updated config does not parse: %v", err)
+	}
+	if !reflect.DeepEqual(got.Permissions.Allow, wantAllow) {
+		t.Fatalf("permissions.allow = %v, want %v", got.Permissions.Allow, wantAllow)
+	}
+	if !reflect.DeepEqual(got.Permissions.Deny, []string{"Bash(rm:*)"}) {
+		t.Fatalf("permissions.deny = %v", got.Permissions.Deny)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "[desktop]\nlegacy_preference = \"keep\"") {
+		t.Fatalf("unrelated section changed:\n%s", raw)
 	}
 }
 

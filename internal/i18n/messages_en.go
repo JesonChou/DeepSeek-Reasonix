@@ -24,11 +24,13 @@ var English = Messages{
 	StepRunDesc:    "one-shot task",
 	HelpFooter:     "reasonix help · all commands",
 
-	ChatTip:           "Context is kept across turns. Type 'exit' or Ctrl-D to quit.",
-	TurnCancelled:     "cancelled — back to prompt",
-	NoSessionToResume: "no saved session to resume — start a new one with `reasonix`",
-	ResumeRequiresTTY: "--resume needs an interactive terminal; pass --continue for the most recent session",
-	PickSessionLabel:  "Resume which session?",
+	ChatTip:             "Context is kept across turns. Type 'exit' or Ctrl-D to quit.",
+	TurnCancelled:       "cancelled — back to prompt",
+	InterruptedRecovery: "This turn was interrupted. Partial output is kept for reference; only completed tool pairs and a bounded recovery summary enter the next model turn. Inspect the workspace before continuing or reverting changes.",
+	RecoveryPaused:      "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send “Continue” to start a fresh attempt, or add instructions to change direction.",
+	NoSessionToResume:   "no saved session to resume — start a new one with `reasonix`",
+	ResumeRequiresTTY:   "--resume needs an interactive terminal; pass --continue for the most recent session",
+	PickSessionLabel:    "Resume which session?",
 
 	ResumeListHeader:    "sessions (/resume <n> to switch)",
 	ResumeBusy:          "finish or cancel the current turn before resuming",
@@ -63,8 +65,9 @@ var English = Messages{
 	ChatStatusBalanceLabel:                 "BAL",
 	ChatStatusCacheNowFmt:                  "turn hit %s",
 	ChatStatusCacheAvgFmt:                  "avg %s",
-	ChatStatusPlanApproval:                 "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
-	PlanApprovalPrompt:                     "Plan ready above — Enter/y to approve & execute, n/Esc to keep planning",
+	ChatStatusPlanApproval:                 "1 execute · 2 revise · 3 exit without executing · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
+	PlanApprovalPrompt:                     "Plan ready above — choose what to do next",
+	PlanApprovalChoices:                    "1. Start execution\n2. Revise plan (keep planning)\n3. Exit without executing\nChoose [1/2/3] (y starts; n/Esc keeps planning)",
 	ChatStatusToolApproval:                 "1 approve once · 2 allow scope this session · 3/4 prefix or save when offered · n/Esc deny · Ctrl-C cancels turn",
 	AskTypeSomething:                       "Type something else",
 	AskTypingHint:                          "type below, Enter to confirm",
@@ -79,6 +82,12 @@ var English = Messages{
 	BashPrefixChoices:                      "1. Allow once\n2. Allow %s for this session\n3. Always allow %s (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
 	PlanModeReadOnlyCommandChoices:         "1. Trust once\n2. Trust this prefix for this session\n3. Always trust this prefix for plan mode (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
 	FreshHumanApprovalChoices:              "1. Allow once\n2. Deny\nChoose [1/2] (y/n also work)",
+	RecoveryApprovalChoices:                "1. Continue once\n2. Try another approach",
+	RecoveryPlanChangeChoices:              "1. Adopt the new plan and continue\n2. Do not adopt; let Auto adjust",
+	RecoveryPlanDecisionPrompt:             "The execution plan needs your decision",
+	RecoveryPlanBeforeFmt:                  "Previous plan: %s",
+	RecoveryPlanAfterFmt:                   "Proposed plan: %s",
+	RecoveryTaskGrantChoices:               "1. Continue once\n2. Continue and allow similar actions in this task\n3. Try another approach",
 	SandboxEscapeApprovalChoices:           "1. Allow once\n2. Use real environment for this session\n3. Deny\nChoose [1/2/3] (y/a/n also work)",
 	ApprovalNeededFmt:                      "approval needed: %s",
 	ApprovalNeededWithSubjectFmt:           "approval needed: %s %s",
@@ -99,11 +108,6 @@ var English = Messages{
 	MemoryApprovalSaveUpdate:               "Save/update memory",
 	MemoryApprovalBodyLabel:                "body",
 	MemoryApprovalArchiveFmt:               "Archive memory %q",
-	MCPDestructiveSubjectFmt:               "MCP %s declares destructive side effects",
-	MCPDestructiveReason:                   "This installed MCP tool declares destructive side effects. Review the target and arguments before allowing this call. Auto/YOLO approval cannot answer this decision.",
-	MCPDestructiveDeclined:                 "the user declined this destructive MCP tool call - do not retry it; ask how they would like to proceed.",
-	MCPReviewerUnavailableReason:           "The configured automatic approval reviewer is unavailable or returned no verdict. This call needs a fresh human decision; Auto/YOLO approval and session grants cannot answer it.",
-	MCPReviewerUnavailableDeclined:         "the user declined this MCP tool call after the automatic reviewer was unavailable - do not retry it; ask how they would like to proceed.",
 	PlanModeBashTrustSubjectFmt:            "Trust %q as a read-only command prefix while planning\nCommand: %s",
 	PlanModeBashTrustReason:                "This bash command is not in Reasonix's built-in read-only set. Confirm only if this exact prefix is read-only for planning and research. Auto/YOLO approval cannot answer this trust prompt.",
 	PlanModeBashTrustDeclined:              "the user declined to trust this bash command as read-only for plan mode - do not retry it; continue with other trusted read-only tools or ask how to proceed.",
@@ -209,6 +213,8 @@ var English = Messages{
 	MouseCopiedHint:              "copied to clipboard",
 	ClipboardCopyOSC52Hint:       "copy sent via OSC 52 — terminal permission may be required",
 	ClipboardCopyFallbackHint:    "native clipboard unavailable — copy sent via OSC 52",
+	ClipboardTextPasteRemoteHint: "mouse paste cannot read your local clipboard or PRIMARY selection over SSH — use the terminal paste shortcut or /mouse",
+	ClipboardTextPasteFailedFmt:  "paste text failed: %v",
 	ClipboardImagePastingHint:    "Pasting image…",
 	ClipboardImagePasteFailedFmt: "paste image failed: %v",
 	MouseCaptureOnHint:           "mouse capture on — in-app drag-select/scrollbar/wheel active",
@@ -239,6 +245,7 @@ var English = Messages{
 	CmdRemember:         "save a memory note",
 	CmdForget:           "archive a saved memory",
 	CmdMcp:              "MCP servers",
+	CmdRemote:           "remote SSH hosts",
 	CmdHooks:            "manage hooks",
 	CmdPlugins:          "manage plugin packages",
 	CmdPasteImage:       "paste clipboard image",
@@ -252,7 +259,6 @@ var English = Messages{
 	CmdSandbox:          "show sandbox status",
 	CmdEffort:           "set reasoning effort",
 	CmdMouse:            "toggle in-app mouse capture (off = native terminal selection/right-click)",
-	CmdAutoPlan:         "configure automatic plan mode",
 	CmdReasonLang:       "set visible reasoning language",
 	CmdHelp:             "list commands",
 	CmdTodo:             "dismiss the task list",
@@ -273,7 +279,6 @@ var English = Messages{
 	ArgMcpList:          "show configured servers",
 	ArgMcpConnected:     "connected",
 	ArgHooksList:        "list active hooks",
-	ArgHooksTrust:       "trust this project's hooks",
 	ArgModelCurrent:     "current",
 	ArgEffortAuto:       "use the model default",
 	ArgEffortLow:        "lighter reasoning",
@@ -295,7 +300,7 @@ var English = Messages{
 	ListSkillsHeaderFmt: "skills (%d)",
 	ListSkillsNone:      "skills: none defined — invoke a built-in like /init, or author one with install_skill",
 	ListHooksHeaderFmt:  "hooks (%d active)",
-	ListHooksNone:       "hooks: none active — configure in .reasonix/settings.json (project, after trust) or <Reasonix home>/settings.json (global)",
+	ListHooksNone:       "hooks: none active — configure in .reasonix/settings.json (project) or <Reasonix home>/settings.json (global)",
 	ListMcpHeader:       "mcp servers",
 	ListMcpNone:         "mcp: no servers connected — add one in reasonix.toml ([[plugins]]) or a project .mcp.json",
 
@@ -313,7 +318,7 @@ var English = Messages{
 	GoalSetFmt:                "goal set → %s",
 	GoalCleared:               "goal cleared",
 	ModelSwitchUnavailable:    "model switching is unavailable in this session",
-	ModelSwitchBusy:           "finish or cancel the current turn before switching models",
+	ModelSwitchBusy:           "finish or cancel active work and stop background jobs before switching models",
 	ModelAlreadyOnFmt:         "already on %s",
 	ModelSwitchingFmt:         "switching to %s…",
 	ModelSwitchedFmt:          "switched to %s (conversation carried over; prompt cache resets)",
@@ -436,6 +441,18 @@ var English = Messages{
 	AnthropicFetchModelsFailedFmt:  "Failed to fetch models for %s: %v",
 	AnthropicSelectModelsLabel:     "Select models to enable for %s",
 
+	RemoteConnectingFmt:       "connecting to %s…",
+	RemoteConnectedFmt:        "connected to %s",
+	RemoteReconnectingFmt:     "reconnecting to %s (attempt %d)…",
+	RemoteDegradedFmt:         "connected to %s, but some forwards are down",
+	RemoteDisconnected:        "disconnected (remote serve keeps running)",
+	RemoteServeReadyFmt:       "remote serve ready: %s",
+	RemoteHostKeyPromptFmt:    "unknown host key for %s\n  type:        %s\n  fingerprint: %s",
+	RemotePassphrasePromptFmt: "passphrase for %s:",
+	RemotePasswordPromptFmt:   "password for %s:",
+	RemoteBootstrapStepFmt:    "remote serve: %s %s",
+	RemoteNoHostsHint:         "no remote hosts configured; add one with `reasonix remote add <name> [user@]host`",
+
 	UnknownCommandFmt:         "unknown command %q",
 	UsageRunHint:              "usage: reasonix -p [--model NAME] <task>",
 	ErrorPrefix:               "error:",
@@ -448,6 +465,8 @@ var English = Messages{
 	ProviderErrAuthRejected:        "Authentication failed (HTTP 401): the server rejected your API key. It may be wrong or expired, or the provider hit a transient auth/quota issue — retried with backoff and still failed. Try again shortly, or check the key in .env / run `reasonix setup`.",
 	ProviderErrInsufficientBalance: "Insufficient balance (HTTP 402): your account is out of credit. Top up your account, then retry.",
 	ProviderErrUnprocessable:       "Invalid parameters (HTTP 422): a request parameter was rejected. This is likely a bug — please report it if it persists.",
+	ProviderErrInputSensitive:      "MiniMax rejected the input during content review (error 1026). The review may include conversation history and tool results; adjust the relevant content or start a new session with only the necessary context. Repeating the same request is unlikely to help.",
+	ProviderErrOutputSensitive:     "MiniMax rejected the generated output during content review (error 1027). Adjust the request and try again, or use another provider if the rejection persists.",
 	ProviderErrRateLimited:         "Rate limit reached (HTTP 429): too many requests (TPM/RPM). Retried with backoff — slow down or try again shortly.",
 	ProviderErrServer:              "Server error (HTTP 500): the provider hit an internal fault. Retried with backoff; if it keeps failing, try again later.",
 	ProviderErrServerBusy:          "Server busy (HTTP 503): the provider is overloaded. Retried with backoff; please try again shortly.",
@@ -492,17 +511,22 @@ Usage:
   reasonix [--model NAME] [-c|--continue] [-r|--resume [QUERY]] [--permission-mode MODE] [--effort LEVEL] [--add-dir PATH]   interactive session
   reasonix -p|--print [--model NAME] [--output-format text|json|stream-json] [--allowed-tools RULES] [--add-dir PATH] <task>
   reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
+  reasonix run --events-jsonl [--model NAME] <task>      emit redacted structured events as JSONL
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI-powered code review on local diffs
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  serve over HTTP+SSE (with optional auth)
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
   reasonix setup [path]                                 interactive config wizard; writes reasonix.toml (+ .env)
-  reasonix config auto-plan [off|on]                    configure automatic plan mode
   reasonix config reasoning-language [auto|zh|en]        configure visible reasoning language
   reasonix mcp <add|remove|list|import>                 manage MCP servers in reasonix.toml
   reasonix subagent <list|create|edit|delete|try|run>   manage and run isolated subagent profiles
   reasonix init                                         show how to generate project memory (AGENTS.md)
   reasonix doctor [--json]                              print redacted local diagnostics
   reasonix doctor session <branch-id> [--zip] [--out PATH]  export a session conflict diagnostic zip
+  reasonix session list --json [--dir PATH]             list redacted sessions for machine clients
+  reasonix session show|status <machine-session-id> --json [--dir PATH]  query one redacted session
+  reasonix session recovery [<machine-session-id>] --json [--dir PATH]  query redacted recovery state
+  reasonix hook list|status --json [--dir PATH]         inspect redacted hook state
+  reasonix task list|show --json [--dir PATH]           inspect redacted task state
   reasonix bot start|doctor|weixin-login                multi-channel IM bot gateway
   reasonix upgrade [--check] [--force]                   self-update to the latest release (also: reasonix update)
   reasonix version

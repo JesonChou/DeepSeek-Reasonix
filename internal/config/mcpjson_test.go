@@ -3,9 +3,9 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -72,16 +72,25 @@ func TestLoadMCPJSONDecodesGB18030(t *testing.T) {
 	}
 }
 
-func TestMCPJSONTrustedReadOnlyToolsRoundTrip(t *testing.T) {
+func TestMCPJSONDropsRemovedTrustedReadOnlyToolsSetting(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, mcpJSONFile)
+	if err := os.WriteFile(path, []byte(`{"mcpServers":{"github":{"command":"old","trusted_read_only_tools":["issue_read"]}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := UpsertMCPJSONPlugin(path, PluginEntry{
-		Name:                 "github",
-		Command:              "npx",
-		Args:                 []string{"-y", "@modelcontextprotocol/server-github"},
-		TrustedReadOnlyTools: []string{"issue_read", "pull_request_read"},
+		Name:    "github",
+		Command: "npx",
+		Args:    []string{"-y", "@modelcontextprotocol/server-github"},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "trusted_read_only_tools") {
+		t.Fatalf("updated .mcp.json retained removed reader setting:\n%s", body)
 	}
 	got, err := loadMCPJSON(path)
 	if err != nil {
@@ -89,10 +98,6 @@ func TestMCPJSONTrustedReadOnlyToolsRoundTrip(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("entries = %+v, want one github entry", got)
-	}
-	tools := got[0].TrustedReadOnlyTools
-	if len(tools) != 2 || tools[0] != "issue_read" || tools[1] != "pull_request_read" {
-		t.Fatalf("trusted read-only tools = %+v", tools)
 	}
 }
 
@@ -154,32 +159,7 @@ func TestMCPJSONCallTimeoutsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMCPJSONApprovalPolicyRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), mcpJSONFile)
-	want := PluginEntry{
-		Name:                     "admin",
-		Command:                  "admin-mcp",
-		DefaultToolsApprovalMode: "writes",
-		Tools: map[string]MCPToolPolicy{
-			"delete/all": {ApprovalMode: "prompt"},
-			"status":     {ApprovalMode: "approve"},
-		},
-		ApprovalsReviewer: "auto_review",
-	}
-	if _, err := UpsertMCPJSONPlugin(path, want); err != nil {
-		t.Fatal(err)
-	}
-	got, err := loadMCPJSON(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].DefaultToolsApprovalMode != want.DefaultToolsApprovalMode ||
-		got[0].ApprovalsReviewer != want.ApprovalsReviewer || !reflect.DeepEqual(got[0].Tools, want.Tools) {
-		t.Fatalf("approval policy round trip = %+v, want %+v", got, want)
-	}
-}
-
-func TestMCPJSONApprovalPolicyUpdatePreservesNestedUnknownFields(t *testing.T) {
+func TestMCPJSONUpdateRemovesRetiredApprovalFieldsAndPreservesUnknownFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), mcpJSONFile)
 	if err := os.WriteFile(path, []byte(`{
   "mcpServers": {
@@ -198,24 +178,8 @@ func TestMCPJSONApprovalPolicyUpdatePreservesNestedUnknownFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := UpsertMCPJSONPlugin(path, PluginEntry{
-		Name:    "admin",
-		Command: "admin-mcp",
-		Tools: map[string]MCPToolPolicy{
-			"wipe": {ApprovalMode: "approve"},
-			"new":  {ApprovalMode: "prompt"},
-		},
-	}); err != nil {
+	if _, err := UpsertMCPJSONPlugin(path, PluginEntry{Name: "admin", Command: "admin-mcp"}); err != nil {
 		t.Fatal(err)
-	}
-
-	entries, err := loadMCPJSON(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 || len(entries[0].Tools) != 2 ||
-		entries[0].Tools["wipe"].ApprovalMode != "approve" || entries[0].Tools["new"].ApprovalMode != "prompt" {
-		t.Fatalf("Reasonix tool policies = %+v, want only updated wipe and new", entries)
 	}
 
 	root, servers, err := readMCPJSONRaw(path)
@@ -236,8 +200,8 @@ func TestMCPJSONApprovalPolicyUpdatePreservesNestedUnknownFields(t *testing.T) {
 	if err := json.Unmarshal(server["tools"], &tools); err != nil {
 		t.Fatal(err)
 	}
-	if len(tools) != 4 {
-		t.Fatalf("raw tools = %+v, want wipe, new, external_only, and remove_keep", tools)
+	if len(tools) != 3 {
+		t.Fatalf("raw tools = %+v, want wipe, external_only, and remove_keep", tools)
 	}
 	if _, ok := tools["wipe"]["enabled"]; !ok {
 		t.Fatal("known tool lost external enabled field")
@@ -256,26 +220,6 @@ func TestMCPJSONApprovalPolicyUpdatePreservesNestedUnknownFields(t *testing.T) {
 	}
 	if _, ok := tools["remove_entirely"]; ok {
 		t.Fatal("approval-only entry should be removed when its policy is cleared")
-	}
-}
-
-func TestMCPJSONApprovalPolicyRejectsNonObjectToolUpdate(t *testing.T) {
-	path := filepath.Join(t.TempDir(), mcpJSONFile)
-	if err := os.WriteFile(path, []byte(`{
-  "mcpServers": {
-    "admin": {"command": "admin-mcp", "tools": {"wipe": false}}
-  }
-}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := UpsertMCPJSONPlugin(path, PluginEntry{
-		Name:    "admin",
-		Command: "admin-mcp",
-		Tools:   map[string]MCPToolPolicy{"wipe": {ApprovalMode: "prompt"}},
-	})
-	if err == nil || !strings.Contains(err.Error(), `tools["wipe"] must be an object`) {
-		t.Fatalf("non-object tool update error = %v", err)
 	}
 }
 
@@ -444,88 +388,6 @@ command = "local-bin"
 	}
 }
 
-func TestLoadForRootRestrictsProjectMCPApprovalEscalation(t *testing.T) {
-	isolateUserConfigHome(t)
-	writeConfigTestFile(t, UserConfigPath(), `
-[[plugins]]
-name = "user-global"
-command = "global-server"
-default_tools_approval_mode = "approve"
-approvals_reviewer = "auto_review"
-
-[plugins.tools.wipe]
-approval_mode = "approve"
-
-[[plugins]]
-name = "shared"
-command = "global-shared"
-default_tools_approval_mode = "prompt"
-approvals_reviewer = "user"
-
-[plugins.tools.wipe]
-approval_mode = "prompt"
-`)
-	root := t.TempDir()
-	writeConfigTestFile(t, filepath.Join(root, "reasonix.toml"), `
-[[plugins]]
-name = "project-toml"
-command = "project-server"
-default_tools_approval_mode = "approve"
-approvals_reviewer = "auto_review"
-
-[plugins.tools.wipe]
-approval_mode = "approve"
-
-[[plugins]]
-name = "shared"
-command = "project-shared"
-default_tools_approval_mode = "auto"
-approvals_reviewer = "auto_review"
-
-[plugins.tools.wipe]
-approval_mode = "approve"
-`)
-	writeConfigTestFile(t, filepath.Join(root, ".mcp.json"), `{
-  "mcpServers": {
-    "project-json": {
-      "command": "json-server",
-      "default_tools_approval_mode": "approve",
-      "approvals_reviewer": "auto_review",
-      "tools": {"wipe": {"approval_mode": "approve"}}
-    }
-  }
-}`)
-
-	cfg, err := LoadForRootReadOnly(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	byName := make(map[string]PluginEntry, len(cfg.Plugins))
-	for _, entry := range cfg.Plugins {
-		byName[entry.Name] = entry
-	}
-	for _, name := range []string{"project-toml", "project-json"} {
-		entry, ok := byName[name]
-		if !ok {
-			t.Fatalf("plugin %q missing from %+v", name, cfg.Plugins)
-		}
-		if entry.DefaultToolsApprovalMode != "auto" || entry.ApprovalsReviewer != "user" || entry.Tools["wipe"].ApprovalMode != "auto" {
-			t.Fatalf("project plugin %q retained approval escalation: %+v", name, entry)
-		}
-	}
-	global := byName["user-global"]
-	if global.DefaultToolsApprovalMode != "approve" || global.ApprovalsReviewer != "auto_review" || global.Tools["wipe"].ApprovalMode != "approve" {
-		t.Fatalf("user-global approval policy was restricted: %+v", global)
-	}
-	shared := byName["shared"]
-	if shared.Command != "project-shared" {
-		t.Fatalf("project connection settings did not win for shared plugin: %+v", shared)
-	}
-	if shared.DefaultToolsApprovalMode != "prompt" || shared.ApprovalsReviewer != "user" || shared.Tools["wipe"].ApprovalMode != "prompt" {
-		t.Fatalf("project downgraded user-global approval policy for shared plugin: %+v", shared)
-	}
-}
-
 func TestLoadMergesPluginsAcrossTOMLSources(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
@@ -562,6 +424,159 @@ func TestLoadMergesPluginsAcrossTOMLSources(t *testing.T) {
 	}
 	if sources["globalmcp"] != MCPSourceUserConfig || sources["projectmcp"] != MCPSourceProjectConfig {
 		t.Fatalf("plugin provenance = %+v", sources)
+	}
+}
+
+func TestLoadProjectMCPPriorityIsReasonixThenMCPJSONThenGlobal(t *testing.T) {
+	_, userConfig, _ := legacyHome(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(userConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userConfig, []byte(`
+[[plugins]]
+name = "shared"
+command = "global-mcp"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, mcpJSONFile), []byte(`{
+  "mcpServers": {
+    "shared": { "command": "project-json-mcp" }
+  }
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadForRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := pluginEntryByName(cfg.Plugins, "shared")
+	if !ok || entry.Command != "project-json-mcp" || entry.Source != MCPSourceProjectMCPJSON {
+		t.Fatalf("global + .mcp.json effective entry = %+v, want project .mcp.json", entry)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "reasonix.toml"), []byte(`
+[[plugins]]
+name = "shared"
+command = "project-reasonix-mcp"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadForRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok = pluginEntryByName(cfg.Plugins, "shared")
+	if !ok || entry.Command != "project-reasonix-mcp" || entry.Source != MCPSourceProjectConfig {
+		t.Fatalf("reasonix.toml + .mcp.json + global effective entry = %+v, want project reasonix.toml", entry)
+	}
+}
+
+func TestUpsertPluginInSourcePreservesGlobalAndProjectBoundaries(t *testing.T) {
+	_, userConfig, _ := legacyHome(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(userConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userConfig, []byte(`
+[[plugins]]
+name = "global"
+command = "global-old"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(root, "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte(`
+[[plugins]]
+name = "project"
+command = "project-old"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if path, err := UpsertPluginInSourceForRoot(root, PluginEntry{
+		Name: "global", Command: "global-new", Source: MCPSourceUserConfig,
+	}); err != nil || !samePath(path, userConfig) {
+		t.Fatalf("upsert global path=%q err=%v, want %q", path, err, userConfig)
+	}
+	if path, err := UpsertPluginInSourceForRoot(root, PluginEntry{
+		Name: "project", Command: "project-new", Source: MCPSourceProjectConfig,
+	}); err != nil || !samePath(path, projectPath) {
+		t.Fatalf("upsert project path=%q err=%v, want %q", path, err, projectPath)
+	}
+
+	globalCfg := LoadForEdit(userConfig)
+	if entry, ok := pluginEntryByName(globalCfg.Plugins, "global"); !ok || entry.Command != "global-new" {
+		t.Fatalf("global config entry = %+v, found=%v", entry, ok)
+	}
+	if _, ok := pluginEntryByName(globalCfg.Plugins, "project"); ok {
+		t.Fatalf("project MCP leaked into global config: %+v", globalCfg.Plugins)
+	}
+	projectCfg := LoadForEdit(projectPath)
+	if entry, ok := pluginEntryByName(projectCfg.Plugins, "project"); !ok || entry.Command != "project-new" {
+		t.Fatalf("project config entry = %+v, found=%v", entry, ok)
+	}
+	if _, ok := pluginEntryByName(projectCfg.Plugins, "global"); ok {
+		t.Fatalf("global MCP leaked into project config: %+v", projectCfg.Plugins)
+	}
+}
+
+func TestRemoveEffectivePluginRevealsLowerPriorityDeclaration(t *testing.T) {
+	_, userConfig, _ := legacyHome(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(userConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userConfig, []byte(`
+[[plugins]]
+name = "shared"
+command = "global-mcp"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(root, "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte(`
+[[plugins]]
+name = "shared"
+command = "project-reasonix-mcp"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mcpPath := filepath.Join(root, mcpJSONFile)
+	if err := os.WriteFile(mcpPath, []byte(`{
+  "mcpServers": {
+    "shared": { "command": "project-json-mcp" }
+  }
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, ok, path, err := RemovePluginFromEffectiveSourceForRoot(root, "shared")
+	if err != nil || !ok || removed.Source != MCPSourceProjectConfig || !samePath(path, projectPath) {
+		t.Fatalf("remove project TOML = entry:%+v removed:%v path:%q err:%v", removed, ok, path, err)
+	}
+	cfg, err := LoadForRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, found := pluginEntryByName(cfg.Plugins, "shared")
+	if !found || entry.Source != MCPSourceProjectMCPJSON || entry.Command != "project-json-mcp" {
+		t.Fatalf("after removing project TOML effective entry = %+v, found=%v", entry, found)
+	}
+
+	removed, ok, path, err = RemovePluginFromEffectiveSourceForRoot(root, "shared")
+	if err != nil || !ok || removed.Source != MCPSourceProjectMCPJSON || !samePath(path, mcpPath) {
+		t.Fatalf("remove project .mcp.json = entry:%+v removed:%v path:%q err:%v", removed, ok, path, err)
+	}
+	cfg, err = LoadForRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, found = pluginEntryByName(cfg.Plugins, "shared")
+	if !found || entry.Source != MCPSourceUserConfig || entry.Command != "global-mcp" {
+		t.Fatalf("after removing project sources effective entry = %+v, found=%v", entry, found)
 	}
 }
 
@@ -741,6 +756,47 @@ Authorization = "Bearer ${TOML_TOKEN}"
 	}
 	if !strings.Contains(string(mcpRaw), "access_token=json") {
 		t.Fatalf(".mcp.json collision entry should be left untouched:\n%s", mcpRaw)
+	}
+}
+
+func TestClearPluginAuthenticationInSourceForRootDoesNotFollowWorkingDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	write := func(root, token string) {
+		t.Helper()
+		raw := fmt.Sprintf(`[[plugins]]
+name = "dida"
+type = "http"
+url = "https://example.test/mcp?access_token=%s&workspace=main"
+`, token)
+		if err := os.WriteFile(filepath.Join(root, "reasonix.toml"), []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(rootA, "root-a")
+	write(rootB, "root-b")
+	t.Chdir(rootB)
+
+	updated, changed, source, err := ClearPluginAuthenticationInSourceForRoot(rootA, "dida")
+	if err != nil {
+		t.Fatalf("ClearPluginAuthenticationInSourceForRoot: %v", err)
+	}
+	if !changed || updated.URL != "https://example.test/mcp?workspace=main" {
+		t.Fatalf("updated = %+v, changed = %v", updated, changed)
+	}
+	if want := filepath.Join(rootA, "reasonix.toml"); !samePath(source, want) {
+		t.Fatalf("source = %q, want %q", source, want)
+	}
+	rootBRaw, err := os.ReadFile(filepath.Join(rootB, "reasonix.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rootBRaw), "access_token=root-b") {
+		t.Fatalf("non-target workspace was modified:\n%s", rootBRaw)
 	}
 }
 

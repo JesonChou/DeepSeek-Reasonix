@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,15 @@ func isolateControlConfigHome(t *testing.T) string {
 	t.Setenv("AppData", filepath.Join(home, "AppData"))
 	t.Chdir(t.TempDir())
 	return home
+}
+
+func controlTestPluginByName(entries []config.PluginEntry, name string) (config.PluginEntry, bool) {
+	for _, entry := range entries {
+		if entry.Name == name {
+			return entry, true
+		}
+	}
+	return config.PluginEntry{}, false
 }
 
 type appendingRunner struct {
@@ -740,6 +750,11 @@ func TestSnapshotConflictRecoveryTransplantsInFlightTurnMarker(t *testing.T) {
 	if err := agent.MarkSessionInFlightTurn(path, 2, true); err != nil {
 		t.Fatalf("MarkSessionInFlightTurn: %v", err)
 	}
+	markedMeta, ok, err := agent.LoadBranchMeta(path)
+	if err != nil || !ok || markedMeta.InFlightTurn == nil {
+		t.Fatalf("LoadBranchMeta marked ok=%v err=%v meta=%+v", ok, err, markedMeta)
+	}
+	markedAt := markedMeta.InFlightTurn.StartedAt
 
 	if err := stale.Snapshot(); err != nil {
 		t.Fatalf("Snapshot stale diverged: %v", err)
@@ -765,6 +780,9 @@ func TestSnapshotConflictRecoveryTransplantsInFlightTurnMarker(t *testing.T) {
 	}
 	if recMeta.InFlightTurn.StartMessageIndex != 2 || !recMeta.InFlightTurn.PreserveUser {
 		t.Fatalf("transplanted marker = %+v, want start index 2 with preserve_user", recMeta.InFlightTurn)
+	}
+	if !recMeta.InFlightTurn.StartedAt.Equal(markedAt) {
+		t.Fatalf("transplanted marker time = %v, want original %v", recMeta.InFlightTurn.StartedAt, markedAt)
 	}
 }
 
@@ -815,11 +833,11 @@ func TestRecoverInterruptedTurnSparesTurnContinuedOnRecoveryBranch(t *testing.T)
 	}
 }
 
-// TestRecoverInterruptedTurnStripsGenuineCrash pins the crash-recovery
+// TestRecoverInterruptedTurnPreservesGenuineCrashDisplay pins the crash-recovery
 // behavior the recovery-child guard must not swallow: with no recovery branch
 // in sight, an in-flight marker means the runtime died mid-turn and the
-// partial tail is stripped (preserving the user prompt).
-func TestRecoverInterruptedTurnStripsGenuineCrash(t *testing.T) {
+// partial tail becomes provider-excluded display history.
+func TestRecoverInterruptedTurnPreservesGenuineCrashDisplay(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
 
@@ -841,8 +859,12 @@ func TestRecoverInterruptedTurnStripsGenuineCrash(t *testing.T) {
 	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
 	c.recoverInterruptedTurn(path)
 
-	if got := c.executor.Session().Len(); got != 2 {
-		t.Fatalf("message count after crash recovery = %d, want 2 (sys + preserved user prompt)", got)
+	if got := c.executor.Session().Len(); got != 3 {
+		t.Fatalf("message count after crash recovery = %d, want system + user + local recovery", got)
+	}
+	recovery := c.executor.Session().Snapshot()[2]
+	if !recovery.LocalOnly || recovery.Content != "partial" || recovery.InterruptedTurn == nil || !recovery.InterruptedTurn.Pending {
+		t.Fatalf("crash display/recovery was not retained safely: %+v", recovery)
 	}
 	meta, ok, err := agent.LoadBranchMeta(path)
 	if err != nil || !ok {
@@ -850,6 +872,76 @@ func TestRecoverInterruptedTurnStripsGenuineCrash(t *testing.T) {
 	}
 	if meta.InFlightTurn != nil {
 		t.Fatal("in-flight marker not cleared after crash recovery")
+	}
+}
+
+func TestRecoverInterruptedTurnAfterCompactionRelocatesVisibleTurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compacted-crash.jsonl")
+
+	orig := agent.NewSession("sys")
+	for i := 0; i < 3; i++ {
+		orig.Add(provider.Message{Role: provider.RoleUser, Content: "old task"})
+		orig.Add(provider.Message{Role: provider.RoleAssistant, Content: "old answer"})
+	}
+	staleStart := orig.Len()
+	if err := orig.Save(path); err != nil {
+		t.Fatalf("Save original: %v", err)
+	}
+	if err := agent.MarkSessionInFlightTurn(path, staleStart, true); err != nil {
+		t.Fatalf("MarkSessionInFlightTurn: %v", err)
+	}
+	meta, ok, err := agent.LoadBranchMeta(path)
+	if err != nil || !ok || meta.InFlightTurn == nil {
+		t.Fatalf("LoadBranchMeta ok=%v err=%v meta=%+v", ok, err, meta)
+	}
+
+	compacted := agent.NewSession("sys")
+	compacted.Add(provider.Message{Role: provider.RoleUser, Content: "<compaction-summary>\nold work\n</compaction-summary>"})
+	compacted.Add(provider.Message{Role: provider.RoleUser, Content: "update a.txt", CreatedAt: meta.InFlightTurn.StartedAt.UnixMilli() + 1})
+	compacted.Add(provider.Message{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
+		ID: "write-1", Name: "write_file", Arguments: `{"path":"a.txt","content":"ok"}`,
+	}}})
+	compacted.Add(provider.Message{Role: provider.RoleTool, ToolCallID: "write-1", Name: "write_file", Content: "wrote a.txt"})
+	compacted.Add(provider.Message{Role: provider.RoleAssistant, Content: "partial final answer", ReasoningContent: "private partial reasoning"})
+	if compacted.Len() >= staleStart {
+		t.Fatalf("test setup did not stale boundary: compacted=%d start=%d", compacted.Len(), staleStart)
+	}
+	if err := compacted.Save(path); err != nil {
+		t.Fatalf("Save compacted: %v", err)
+	}
+
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	exec := agent.New(nil, nil, loaded, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
+	c.recoverInterruptedTurn(path)
+
+	msgs := exec.Session().Snapshot()
+	userCount := 0
+	for _, m := range msgs {
+		if m.Role == provider.RoleUser && StripComposePrefixes(m.Content) == "update a.txt" {
+			userCount++
+		}
+	}
+	if userCount != 1 {
+		t.Fatalf("current user occurrences = %d, want 1: %+v", userCount, msgs)
+	}
+	if len(msgs) != 6 || !agent.IsCompactionSummary(msgs[1]) || msgs[3].Role != provider.RoleAssistant || msgs[4].Role != provider.RoleTool || !msgs[5].LocalOnly {
+		t.Fatalf("crash recovery transcript = %+v", msgs)
+	}
+	recovery := msgs[5].InterruptedTurn
+	if recovery == nil || !recovery.Pending || len(recovery.CompletedTools) != 1 || recovery.CompletedTools[0].Name != "write_file" || !recovery.DroppedPartialText || !recovery.DroppedPartialReasoning {
+		t.Fatalf("crash recovery metadata = %+v", recovery)
+	}
+	meta, ok, err = agent.LoadBranchMeta(path)
+	if err != nil || !ok {
+		t.Fatalf("LoadBranchMeta after recovery ok=%v err=%v", ok, err)
+	}
+	if meta.InFlightTurn != nil {
+		t.Fatalf("in-flight marker survived recovery: %+v", meta.InFlightTurn)
 	}
 }
 
@@ -1111,6 +1203,55 @@ func TestConcurrentSnapshotsShareSingleRecoveryHandoff(t *testing.T) {
 	recoveries := recoveryTranscriptPaths(matches)
 	if len(recoveries) != 1 || recoveries[0] != first.recoveryPath {
 		t.Fatalf("recovery branches = %v err=%v, want only %q", matches, err, first.recoveryPath)
+	}
+}
+
+func TestRecoverShutdownSnapshotPersistsAndReanchorsSession(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	base := agent.NewSession("sys")
+	base.Add(provider.Message{Role: provider.RoleUser, Content: "persisted"})
+	if err := base.SaveSnapshot(path); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	current, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	current.Add(provider.Message{Role: provider.RoleAssistant, Content: "shutdown tail"})
+	exec := agent.New(nil, nil, current, agent.Options{}, event.Discard)
+	var handoff SessionRecoveryInfo
+	c := New(Options{
+		Executor:    exec,
+		SessionDir:  dir,
+		SessionPath: path,
+		Label:       "shutdown",
+		OnSessionRecovered: func(info SessionRecoveryInfo) error {
+			handoff = info
+			return nil
+		},
+	})
+
+	recoveryPath, err := c.recoverShutdownSnapshot(path, agent.ErrSessionFileLockHeld)
+	if err != nil {
+		t.Fatalf("recoverShutdownSnapshot: %v", err)
+	}
+	if recoveryPath == "" || recoveryPath == path {
+		t.Fatalf("recovery path = %q, want a distinct session", recoveryPath)
+	}
+	if c.SessionPath() != recoveryPath {
+		t.Fatalf("controller session path = %q, want %q", c.SessionPath(), recoveryPath)
+	}
+	if handoff.OriginalPath != path || handoff.RecoveryPath != recoveryPath || handoff.Reason != "shutdown session file lock timeout" {
+		t.Fatalf("shutdown recovery handoff = %+v", handoff)
+	}
+	recovered, err := agent.LoadSession(recoveryPath)
+	if err != nil {
+		t.Fatalf("load shutdown recovery: %v", err)
+	}
+	if got := recovered.Snapshot(); len(got) != 3 || got[2].Content != "shutdown tail" {
+		t.Fatalf("shutdown recovery transcript = %+v", got)
 	}
 }
 
@@ -2254,7 +2395,7 @@ func TestTwoModelShortChoiceReplySkipsPlanner(t *testing.T) {
 	execSess.Add(provider.Message{Role: provider.RoleUser, Content: "先给我两个执行方案"})
 	execSess.Add(provider.Message{Role: provider.RoleAssistant, Content: "两个执行方式可选：\n\n1. Subagent-Driven（推荐）\n2. 当前会话执行\n\n你选哪种？"})
 	exec := agent.New(execProv, tool.NewRegistry(), execSess, agent.Options{}, event.Discard)
-	coord := agent.NewCoordinator(planner, agent.NewSession("planner sys"), nil, tool.NewRegistry(), agent.Options{}, exec, 0, event.Discard, NewPlannerGate(nil))
+	coord := agent.NewCoordinator(planner, agent.NewSession("planner sys"), nil, tool.NewRegistry(), agent.Options{}, exec, 0, event.Discard, NewPlannerGate())
 	c := New(Options{Runner: coord, Executor: exec, SystemPrompt: "exec sys", SessionDir: dir, SessionPath: filepath.Join(dir, "session.jsonl"), Label: "test"})
 
 	if err := c.Run(context.Background(), "1"); err != nil {
@@ -2339,9 +2480,126 @@ func TestDisconnectMCPServerRemovesLazyPlaceholder(t *testing.T) {
 	}
 }
 
+func TestRegisterMCPServerOnDemandDefersConnectionUntilFirstUse(t *testing.T) {
+	t.Setenv("REASONIX_CACHE_HOME", t.TempDir())
+	var requests atomic.Int32
+	var initializes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		var result any
+		switch req.Method {
+		case "initialize":
+			initializes.Add(1)
+			result = map[string]any{
+				"protocolVersion": "2025-03-26",
+				"serverInfo":      map[string]any{"name": "on-demand", "version": "1"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{
+				"name":        "echo",
+				"description": "Echo a value.",
+				"inputSchema": map[string]any{"type": "object"},
+			}}}
+		default:
+			result = map[string]any{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  result,
+		})
+	}))
+	defer server.Close()
+
+	host := plugin.NewHost()
+	defer host.Close()
+	reg := tool.NewRegistry()
+	ctrl := New(Options{Host: host, Registry: reg, PluginCtx: context.Background()})
+	entry := config.PluginEntry{Name: "on-demand", Type: "http", URL: server.URL, Source: config.MCPSourceUserConfig}
+	if _, err := ctrl.RegisterMCPServerOnDemand(entry); err != nil {
+		t.Fatalf("RegisterMCPServerOnDemand: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("enable-time HTTP requests = %d, want zero", got)
+	}
+	connect, ok := reg.Get("mcp__on-demand__connect")
+	if !ok {
+		t.Fatalf("cache-miss connect stub missing; names=%v", reg.Names())
+	}
+	if _, err := connect.Execute(context.Background(), json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "initializing on first use") {
+		t.Fatalf("first-use connect result = %v, want initializing guidance", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !host.HasClient("on-demand") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !host.HasClient("on-demand") {
+		t.Fatal("first tool use did not start the MCP connection")
+	}
+	if got := initializes.Load(); got != 1 {
+		t.Fatalf("initialize calls = %d, want exactly one on-demand start", got)
+	}
+}
+
+func TestControllerMCPHotLifecycleUpdatesCapabilityRuntime(t *testing.T) {
+	t.Setenv("REASONIX_CACHE_HOME", t.TempDir())
+	host := plugin.NewHost()
+	defer host.Close()
+	reg := tool.NewRegistry()
+	runtime := agent.NewMCPCapabilityRuntime(context.Background(), host, nil, reg, nil)
+	ctrl := New(Options{
+		Host: host, Registry: reg, PluginCtx: context.Background(), CapabilityRuntime: runtime,
+	})
+	frontend := runtime.NewFrontend(nil, nil)
+	entry := config.PluginEntry{
+		Name: "hot", Type: "http", URL: "http://127.0.0.1:1", Source: config.MCPSourceUserConfig,
+	}
+
+	if _, err := ctrl.RegisterMCPServerOnDemand(entry); err != nil {
+		t.Fatalf("RegisterMCPServerOnDemand: %v", err)
+	}
+	listed, err := frontend.Execute(context.Background(), json.RawMessage(`{"action":"list"}`))
+	if err != nil || !strings.Contains(listed, `"name": "hot"`) {
+		t.Fatalf("hot add list = %q, %v", listed, err)
+	}
+
+	if !ctrl.UnregisterMCPServerTools("hot") {
+		t.Fatal("UnregisterMCPServerTools returned false")
+	}
+	listed, err = frontend.Execute(context.Background(), json.RawMessage(`{"action":"list"}`))
+	if err != nil || !strings.Contains(listed, `"status": "disabled"`) {
+		t.Fatalf("disabled list = %q, %v", listed, err)
+	}
+
+	if _, err := ctrl.RegisterMCPServerOnDemand(entry); err != nil {
+		t.Fatalf("re-enable RegisterMCPServerOnDemand: %v", err)
+	}
+	if !ctrl.DisconnectMCPServer("hot") {
+		t.Fatal("DisconnectMCPServer returned false for runtime-only placeholder")
+	}
+	listed, err = frontend.Execute(context.Background(), json.RawMessage(`{"action":"list"}`))
+	if err != nil || strings.Contains(listed, `"name": "hot"`) {
+		t.Fatalf("runtime-only disconnect leaked list entry = %q, %v", listed, err)
+	}
+}
+
 func TestAddMCPServerAuthorizesExplicitUserAddBeforeConnecting(t *testing.T) {
 	var configured plugin.Spec
 	c := New(Options{
+		WorkspaceRoot:    "/workspace",
 		MCPConfigureSpec: func(spec *plugin.Spec) { configured = *spec },
 	})
 
@@ -2349,8 +2607,181 @@ func TestAddMCPServerAuthorizesExplicitUserAddBeforeConnecting(t *testing.T) {
 		t.Fatal("AddMCPServer without a command unexpectedly succeeded")
 	}
 	if configured.ConfigSource != string(config.MCPSourceUserConfig) ||
-		!configured.AutoTrust || !configured.ImplicitApproval || configured.RequireLaunchApproval {
+		!configured.Authorized || configured.RequireLaunchApproval || configured.WorkspaceRoot != "/workspace" {
 		t.Fatalf("configured spec = %+v, want user-authorized add-and-use policy", configured)
+	}
+}
+
+func TestAddMCPServerWritesGlobalConfigWithoutShadowingProject(t *testing.T) {
+	isolateControlConfigHome(t)
+	workspace := t.TempDir()
+	projectPath := filepath.Join(workspace, "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte(`
+[[plugins]]
+name = "project-only"
+command = "project-only"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		result := any(map[string]any{})
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": "2025-03-26",
+				"serverInfo":      map[string]any{"name": "global-docs", "version": "1"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{
+				"name":        "search",
+				"description": "Search documentation.",
+				"inputSchema": map[string]any{"type": "object"},
+			}}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	}))
+	defer server.Close()
+
+	host := plugin.NewHost()
+	defer host.Close()
+	ctrl := New(Options{Host: host, Registry: tool.NewRegistry(), PluginCtx: context.Background(), WorkspaceRoot: workspace})
+	if n, err := ctrl.AddMCPServer(config.PluginEntry{Name: "global-docs", Type: "http", URL: server.URL}); err != nil || n != 1 {
+		t.Fatalf("AddMCPServer(global-docs) = (%d, %v), want one connected tool", n, err)
+	}
+	globalCfg := config.LoadForEdit(config.UserConfigPath())
+	globalEntry, found := controlTestPluginByName(globalCfg.Plugins, "global-docs")
+	if !found || globalEntry.URL != server.URL {
+		t.Fatalf("global config entry = %+v, found=%v", globalEntry, found)
+	}
+	projectCfg := config.LoadForEdit(projectPath)
+	if _, found := controlTestPluginByName(projectCfg.Plugins, "global-docs"); found {
+		t.Fatalf("global install leaked into project config: %+v", projectCfg.Plugins)
+	}
+	if _, found := controlTestPluginByName(projectCfg.Plugins, "project-only"); !found {
+		t.Fatalf("project config was not preserved: %+v", projectCfg.Plugins)
+	}
+}
+
+func TestAddMCPServerRejectsProjectNameCollision(t *testing.T) {
+	isolateControlConfigHome(t)
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "reasonix.toml"), []byte(`
+[[plugins]]
+name = "shared"
+command = "project-shared"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctrl := New(Options{Host: plugin.NewHost(), WorkspaceRoot: workspace})
+	defer ctrl.Close()
+	if _, err := ctrl.AddMCPServer(config.PluginEntry{Name: "shared", Command: "global-shared"}); err == nil || !strings.Contains(err.Error(), "already configured") {
+		t.Fatalf("AddMCPServer(shared) error = %v, want project collision", err)
+	}
+	if _, found := controlTestPluginByName(config.LoadForEdit(config.UserConfigPath()).Plugins, "shared"); found {
+		t.Fatal("rejected project collision created a global shadow")
+	}
+}
+
+func TestConnectConfiguredProjectMCPIsTrustedByDefault(t *testing.T) {
+	isolateControlConfigHome(t)
+	workspace := t.TempDir()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		result := any(map[string]any{})
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": "2025-03-26",
+				"serverInfo":      map[string]any{"name": "project-docs", "version": "1"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{
+				"name":        "search",
+				"description": "Search project documentation.",
+				"inputSchema": map[string]any{"type": "object"},
+			}}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  result,
+		})
+	}))
+	defer server.Close()
+	if err := os.WriteFile(filepath.Join(workspace, "reasonix.toml"), []byte(fmt.Sprintf(`
+[[plugins]]
+name = "project-docs"
+type = "http"
+url = %q
+`, server.URL)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	host := plugin.NewHost()
+	defer host.Close()
+	reg := tool.NewRegistry()
+	var configured plugin.Spec
+	ctrl := New(Options{
+		Host:          host,
+		Registry:      reg,
+		PluginCtx:     context.Background(),
+		WorkspaceRoot: workspace,
+		MCPConfigureSpec: func(spec *plugin.Spec) {
+			configured = *spec
+		},
+	})
+
+	n, err := ctrl.ConnectConfiguredMCPServer("project-docs")
+	if err != nil {
+		t.Fatalf("ConnectConfiguredMCPServer: %v", err)
+	}
+	if n != 1 || requests.Load() == 0 {
+		t.Fatalf("trusted project MCP = %d tools, %d requests; want 1 tool and a live connection", n, requests.Load())
+	}
+	if _, ok := reg.Get("mcp__project-docs__search"); !ok {
+		t.Fatalf("project MCP tool missing; names=%v", reg.Names())
+	}
+	if !configured.Authorized || configured.RequireLaunchApproval || configured.Dir != workspace {
+		t.Fatalf("project MCP spec = %+v, want trusted project-scoped runtime", configured)
+	}
+
+	nextHost := plugin.NewHost()
+	defer nextHost.Close()
+	nextCtrl := New(Options{
+		Host:          nextHost,
+		Registry:      tool.NewRegistry(),
+		PluginCtx:     context.Background(),
+		WorkspaceRoot: workspace,
+	})
+	if n, err := nextCtrl.ConnectConfiguredMCPServer("project-docs"); err != nil || n != 1 {
+		t.Fatalf("subsequent project MCP connection = (%d, %v), want zero-confirmation trust", n, err)
 	}
 }
 
@@ -2491,7 +2922,12 @@ tier = "lazy"
 
 	reg := tool.NewRegistry()
 	reg.Add(fakeControlTool{name: "mcp__mock__connect"})
-	c := New(Options{Host: plugin.NewHost(), Registry: reg})
+	host := plugin.NewHost()
+	defer host.Close()
+	spec := plugin.Spec{Name: "mock", Command: "mock-mcp", Authorized: true}
+	runtime := agent.NewMCPCapabilityRuntime(context.Background(), host, []plugin.Spec{spec}, reg, nil)
+	runtime.ConfigureServers([]config.PluginEntry{{Name: "mock", Command: "mock-mcp"}}, []plugin.Spec{spec}, map[string]bool{"mock": true})
+	c := New(Options{Host: host, Registry: reg, CapabilityRuntime: runtime})
 
 	disconnected, err := c.RemoveMCPServer("mock")
 	if err != nil {
@@ -2505,6 +2941,34 @@ tier = "lazy"
 	}
 	if names := c.ConfiguredMCPNames(); len(names) != 0 {
 		t.Fatalf("ConfiguredMCPNames() = %v, want empty after remove", names)
+	}
+	proxy := runtime.NewFrontend(nil, nil)
+	listed, listErr := proxy.Execute(context.Background(), json.RawMessage(`{"action":"list"}`))
+	if listErr != nil || strings.Contains(listed, `"name": "mock"`) {
+		t.Fatalf("removed server leaked through capability list = %q, %v", listed, listErr)
+	}
+}
+
+func TestConfiguredMCPNamesUseControllerWorkspaceInsteadOfProcessCWD(t *testing.T) {
+	isolateControlConfigHome(t)
+	workspace := t.TempDir()
+	other := t.TempDir()
+	t.Chdir(other)
+	if err := os.WriteFile(filepath.Join(workspace, "reasonix.toml"), []byte(`
+[[plugins]]
+name = "workspace-mcp"
+command = "workspace-mcp"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := New(Options{WorkspaceRoot: workspace, Host: plugin.NewHost()})
+	defer c.Close()
+	if got := c.ConfiguredMCPNames(); !reflect.DeepEqual(got, []string{"workspace-mcp"}) {
+		t.Fatalf("ConfiguredMCPNames() = %v, want workspace-mcp from %s", got, workspace)
+	}
+	if got := c.DisconnectedMCPNames(); !reflect.DeepEqual(got, []string{"workspace-mcp"}) {
+		t.Fatalf("DisconnectedMCPNames() = %v, want workspace-mcp from %s", got, workspace)
 	}
 }
 
@@ -3004,140 +3468,6 @@ func TestSessionGrantShortCircuitsGuardianReview(t *testing.T) {
 	}
 }
 
-func TestMCPAutoReviewerIsFinalAndDoesNotPromptHuman(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		outcome string
-		risk    string
-		allow   bool
-	}{
-		{name: "allow", outcome: "allow", risk: "low", allow: true},
-		{name: "deny", outcome: "deny", risk: "high", allow: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			guardianProv := &recordingProvider{
-				name:    "guardian",
-				streams: [][]provider.Chunk{textTurn(fmt.Sprintf(`{"risk_level":%q,"user_authorization":"unknown","outcome":%q,"rationale":"reviewed"}`, tc.risk, tc.outcome))},
-			}
-			guardianSess := guardian.NewSession(guardianProv, tool.NewRegistry(), guardian.PolicyPrompt(), "guardian-test", 0, nil, event.Discard)
-			exec := agent.New(&recordingProvider{name: "executor"}, tool.NewRegistry(), agent.NewSession("sys"), agent.Options{}, event.Discard)
-			prompts := 0
-			c := New(Options{
-				Executor: exec,
-				Guardian: guardianSess,
-				Sink: event.FuncSink(func(e event.Event) {
-					if e.Kind == event.ApprovalRequest {
-						prompts++
-					}
-				}),
-			})
-			gate := permission.NewGate(permission.New("allow", nil, nil, nil), gateApprover{c})
-			allow, _, err := gate.CheckMCP(context.Background(), "mcp__srv__write", "srv/write", json.RawMessage(`{"target":"one"}`), false, false, "prompt", "auto_review")
-			if err != nil || allow != tc.allow || prompts != 0 || len(guardianProv.requests) != 1 {
-				t.Fatalf("auto reviewer result allow=%v err=%v prompts=%d reviews=%d", allow, err, prompts, len(guardianProv.requests))
-			}
-		})
-	}
-}
-
-// TestMCPAutoModeGlobalAllowSkipsMissingReviewer: approval_mode=auto inherits
-// the global posture. When the global policy already allows the call, no
-// reviewer runs at all — this is mode inheritance, not a reviewer fallback.
-func TestMCPAutoModeGlobalAllowSkipsMissingReviewer(t *testing.T) {
-	prompts := 0
-	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
-		if e.Kind == event.ApprovalRequest {
-			prompts++
-		}
-	})})
-	c.SetToolApprovalMode(ToolApprovalAuto)
-	gate := permission.NewGate(permission.New("allow", nil, nil, nil), gateApprover{c})
-	allow, reason, err := gate.CheckMCP(context.Background(), "mcp__srv__write", "srv/write", nil, false, false, "auto", "auto_review")
-	if err != nil || !allow || reason != "" || prompts != 0 {
-		t.Fatalf("globally allowed auto call = (%v,%q,%v), prompts=%d", allow, reason, err, prompts)
-	}
-}
-
-type erroringProvider struct{ requests int }
-
-func (p *erroringProvider) Name() string { return "guardian-down" }
-
-func (p *erroringProvider) Stream(context.Context, provider.Request) (<-chan provider.Chunk, error) {
-	p.requests++
-	return nil, fmt.Errorf("guardian transport down")
-}
-
-// TestMCPAutoReviewerUnavailableDegradesToStrictFreshHuman: when auto_review is
-// configured but the reviewer errors out, the call degrades to a fresh human
-// decision. Session grants must neither answer it nor be minted by it, so a
-// second identical call prompts again.
-func TestMCPAutoReviewerUnavailableDegradesToStrictFreshHuman(t *testing.T) {
-	guardianProv := &erroringProvider{}
-	guardianSess := guardian.NewSession(guardianProv, tool.NewRegistry(), guardian.PolicyPrompt(), "guardian-test", 0, nil, event.Discard)
-	exec := agent.New(&recordingProvider{name: "executor"}, tool.NewRegistry(), agent.NewSession("sys"), agent.Options{}, event.Discard)
-	approvals := make(chan event.Approval, 2)
-	c := New(Options{
-		Executor: exec,
-		Guardian: guardianSess,
-		Sink: event.FuncSink(func(e event.Event) {
-			if e.Kind == event.ApprovalRequest {
-				approvals <- e.Approval
-			}
-		}),
-	})
-	gate := permission.NewGate(permission.New("ask", nil, nil, nil), gateApprover{c})
-	type result struct {
-		allow  bool
-		reason string
-		err    error
-	}
-	run := func() chan result {
-		done := make(chan result, 1)
-		go func() {
-			allow, reason, err := gate.CheckMCP(context.Background(), "mcp__srv__write", "srv/write", json.RawMessage(`{"target":"one"}`), false, false, "auto", "auto_review")
-			done <- result{allow: allow, reason: reason, err: err}
-		}()
-		return done
-	}
-
-	done := run()
-	var approval event.Approval
-	select {
-	case approval = <-approvals:
-	case <-time.After(30 * time.Second):
-		t.Fatal("reviewer failure did not degrade to a human prompt")
-	}
-	// Answer with a session grant: the strict decision must not persist it.
-	c.Approve(approval.ID, true, true, false)
-	select {
-	case got := <-done:
-		if got.err != nil || !got.allow {
-			t.Fatalf("approved degraded call = %+v", got)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("degraded approval never completed")
-	}
-
-	done = run()
-	select {
-	case approval = <-approvals:
-	case <-time.After(30 * time.Second):
-		t.Fatal("second call reused a grant; strict fresh approval must prompt every time")
-	}
-	c.Approve(approval.ID, false, false, false)
-	select {
-	case got := <-done:
-		if got.err != nil || got.allow || !strings.Contains(got.reason, "reviewer was unavailable") {
-			t.Fatalf("declined degraded call = %+v", got)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("degraded decline never completed")
-	}
-	if guardianProv.requests != 2 {
-		t.Fatalf("guardian consulted %d times, want 2", guardianProv.requests)
-	}
-}
-
 func TestHeadlessGateRefusesFreshHumanApprovalTools(t *testing.T) {
 	gate := NewHeadlessPermissionGate(permission.New("ask", nil, nil, nil))
 
@@ -3448,6 +3778,42 @@ func TestApprovalPersistentBashPrefixRememberRule(t *testing.T) {
 	}
 	if len(notices) != 1 || !strings.Contains(notices[0], "Bash(go test:*)") || !strings.Contains(notices[0], "reasonix.toml") {
 		t.Fatalf("notices = %v, want saved rule notice", notices)
+	}
+}
+
+func TestApprovalPersistenceFailureKeepsSessionGrant(t *testing.T) {
+	ids := make(chan string, 1)
+	var notices []event.Event
+	prompts := 0
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				prompts++
+				ids <- e.Approval.ID
+			}
+			if e.Kind == event.Notice {
+				notices = append(notices, e)
+			}
+		}),
+		OnRemember: func(rule string) RememberResult {
+			return RememberResult{Rule: rule, Path: "reasonix.toml", Err: errors.New("disk unavailable")}
+		},
+	})
+	go func() {
+		c.Approve(<-ids, true, true, true)
+	}()
+
+	for i := 0; i < 2; i++ {
+		allow, remember, err := gateApprover{c}.Approve(context.Background(), "bash", "go test ./...", nil)
+		if err != nil || !allow || remember {
+			t.Fatalf("Approve call %d = (%v,%v,%v), want session-allowed despite persistence failure", i, allow, remember, err)
+		}
+	}
+	if prompts != 1 {
+		t.Fatalf("approval prompts = %d, want one because failed persistence must retain the session grant", prompts)
+	}
+	if len(notices) != 1 || notices[0].Level != event.LevelWarn || !strings.Contains(notices[0].Text, "disk unavailable") {
+		t.Fatalf("notices = %+v, want one persistence failure warning", notices)
 	}
 }
 

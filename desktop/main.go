@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"os"
 	"path/filepath"
@@ -92,13 +93,23 @@ func linuxWebviewGpuPolicy(pattern string) linux.WebviewGpuPolicy {
 }
 
 func main() {
+	// OpenSSH launches the Desktop executable itself as the short-lived
+	// SSH_ASKPASS helper. Handle that one-time capability before configuration,
+	// startup tracking, single-instance setup, Wails, or any logging/persistence.
+	if handled, exitCode := RunRemoteAskPassHelper(context.Background(), os.Args[1:], os.Getenv, os.Stdout); handled {
+		os.Exit(exitCode)
+	}
+
 	launch := parseDesktopLaunchArgs(os.Args[1:])
 	if config.SafeModeRequested() {
 		launch.SafeMode = true
 	}
+
 	tracker := repair.NewStartupTracker("")
-	if tracker.SafeModeRecommended() {
-		launch.SafeMode = true
+	var continueLaunch bool
+	launch.SafeMode, continueLaunch = preparePackagedStartupRecovery(tracker, tracker.SafeModeRecommended(), launch.SafeMode)
+	if !continueLaunch {
+		return
 	}
 	if launch.SafeMode {
 		_ = os.Setenv("REASONIX_SAFE_MODE", "1")
@@ -109,11 +120,21 @@ func main() {
 	// counts as a crash toward the Safe Mode threshold.
 	startupState, _ := tracker.Begin(version, launch.SafeMode)
 	trackerOwned := startupState.PID == os.Getpid()
+	// Keep WebKit acceleration enabled during normal Linux launches. If the
+	// startup tracker selects Safe Mode after a crash loop (or the user requests
+	// it explicitly), NVIDIA systems use the broader renderer fallback before
+	// Wails creates the WebKit process. Other platforms provide a no-op.
+	configureWebKitRendererRecovery(launch.SafeMode)
 
 	app := NewApp()
 	if trackerOwned {
 		app.startupTracker = tracker
 	}
+	title := "Reasonix"
+	singleInstance := singleInstanceLock(app)
+	appMenu := app.createAppMenu()
+	dragAndDrop := &options.DragAndDrop{EnableFileDrop: true}
+	bindings := []any{app}
 
 	// Restore saved window size, or fall back to the default.
 	width, height := 1240, 720
@@ -132,8 +153,12 @@ func main() {
 		zoomFactor = zf
 	}
 
+	// On Linux, cover JavaScriptCore's lazy signal-handler installation window.
+	// Other platforms provide a no-op implementation.
+	scheduleWebKitSignalHandlerRepair()
+
 	err := wails.Run(&options.App{
-		Title:     "Reasonix",
+		Title:     title,
 		Width:     width,
 		Height:    height,
 		Frameless: goruntime.GOOS == "windows",
@@ -143,27 +168,32 @@ func main() {
 		// white before CSS loads — particularly visible on WebKitGTK.
 		BackgroundColour: &options.RGBA{R: 26, G: 26, B: 46, A: 255},
 		AssetServer: &assetserver.Options{
-			Assets:     assets,
-			Middleware: assetserver.ChainMiddleware(app.jsProfilingMiddleware(), app.workspaceMediaMiddleware()),
+			Assets: assets,
+			Middleware: assetserver.ChainMiddleware(
+				app.jsProfilingMiddleware(),
+				app.remoteMarkdownImageMiddleware(),
+				app.workspaceMediaMiddleware(),
+				app.themeAssetMiddleware(),
+			),
 		},
 		OnStartup:          app.startup,
 		OnDomReady:         app.domReady,
 		OnBeforeClose:      app.beforeClose,
 		OnShutdown:         app.shutdown,
-		Bind:               []any{app},
-		SingleInstanceLock: singleInstanceLock(app),
+		Bind:               bindings,
+		SingleInstanceLock: singleInstance,
 
 		// Start hidden — domReady positions and shows the window after restoring
 		// geometry, so the user never sees the default size/position flash.
 		StartHidden: true,
 
 		// Native application menu (File > Settings, Edit, Window).
-		Menu: app.createAppMenu(),
+		Menu: appMenu,
 
 		// Native OS file drops: the webview withholds dropped files' paths from the
 		// HTML drop event, so the frontend (composer) reads them via runtime.OnFileDrop
 		// against the --wails-drop-target element instead.
-		DragAndDrop: &options.DragAndDrop{EnableFileDrop: true},
+		DragAndDrop: dragAndDrop,
 
 		// --- per-platform adaptation (see desktop/README.md for the rationale) ---
 		Mac: &mac.Options{

@@ -188,18 +188,12 @@ type Gate interface {
 	Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
 }
 
-// FreshApprovalGate is an optional Gate extension for calls that must be
-// answered by a current human decision even when Auto/YOLO or an allow rule
-// would normally bypass approval. Installed MCP destructiveHint uses it.
-type FreshApprovalGate interface {
-	CheckFresh(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
-}
-
-// MCPApprovalGate applies local per-server/per-tool MCP policy without changing
-// provider-visible tool metadata. Destructive calls are identified separately
-// so the gate can route every invocation through the configured reviewer.
-type MCPApprovalGate interface {
-	CheckMCP(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly, destructive bool, mode, reviewer string) (allow bool, reason string, err error)
+// ExplicitDenyGate exposes the only global permission decision that applies to
+// an already-authorized MCP server. Installing or approving a server is the
+// user's authorization boundary; ordinary ask/fallback posture must not add a
+// second per-call prompt, while explicit deny rules remain authoritative.
+type ExplicitDenyGate interface {
+	ExplicitlyDenies(toolName string, args json.RawMessage) bool
 }
 
 const PlanModeReadOnlyCommandApprovalTool = "plan_mode_read_only_command"
@@ -315,9 +309,33 @@ type Agent struct {
 	// for the agent's lifetime and validates proxy calls after resolution.
 	readOnlyExecution bool
 
+	// plannerMCPExecution relaxes the strict read-only MCP boundary for the
+	// two-model Planner only: authorized, non-destructive MCP targets may run
+	// through use_capability even without readOnlyHint. Ordinary writers, bash,
+	// and destructive MCP stay blocked. Strict read-only sub-agents leave this
+	// false and still require readOnlyHint.
+	plannerMCPExecution bool
+
 	// gate, when non-nil, is the per-call permission gate for both standard and
 	// Plan workflows. nil disables gating entirely.
 	gate Gate
+
+	// recoveryGate, when non-nil, is the Auto Guard boundary for Auto mode.
+	// Shared by root and sub-agents for the same controller task. nil disables
+	// recovery checks (Ask/YOLO, headless without wiring, or feature off).
+	recoveryGate RecoveryGate
+	// recoveryAgentID labels this agent on recovery cards (empty = root).
+	recoveryAgentID string
+	// recoveryTaskID isolates recovery state across concurrent top-level tasks.
+	// Empty shares the root task bucket.
+	recoveryTaskID string
+	// recoveryTaskSummary is the bounded task text for this Agent.Run. It lets a
+	// shared recovery gate review sub-agent mutations against the child task,
+	// rather than the root controller transcript.
+	recoveryTaskSummary string
+	// recoveryRunSeq gives ordinary (non-goal) runs a collision-free host scope.
+	// Goal runs use their stable delivery scope instead.
+	recoveryRunSeq atomic.Uint64
 
 	// planModeReadOnlyTrust is retained for legacy controller wiring. The main
 	// Plan execution path no longer consults it.
@@ -351,6 +369,15 @@ type Agent struct {
 	// run_in_background, task run_in_background, bash_output/kill_shell/wait) can
 	// reach it. nil leaves those tools to degrade gracefully.
 	jobs *jobs.Manager
+
+	// writeScheduler coordinates parent-agent writes against background
+	// subagent write claims. Set on the parent executor only (subagentDepth 0);
+	// reservation is taken around Execute so late-loaded MCP/Economy tools are
+	// covered without registry wrapping. Provider-visible schemas are unchanged.
+	writeScheduler *SubagentScheduler
+	// writeWorkspaceRoot is the workspace used to normalize parent write
+	// reservations when writeScheduler is set.
+	writeWorkspaceRoot string
 
 	// workspaceLease is shared by every writer-capable agent in one Delivery
 	// session. It is acquired lazily on the first mutation and held through the
@@ -462,6 +489,11 @@ type Agent struct {
 	keepPolicy          KeepPolicy
 	compactStuck        bool
 	consecutiveCompacts int
+	// activeTurnCreatedAt identifies the real/synthetic user message that began
+	// the currently running turn. Compaction may rewrite older history while a
+	// tool loop is active, but it must keep this message and everything after it
+	// verbatim so cancellation/crash recovery can retain completed tool pairs.
+	activeTurnCreatedAt atomic.Int64
 
 	// stormSig / stormCount track a run of turns that keep failing or getting
 	// blocked the same way so the loop can break a death-spiral. The signature is
@@ -556,6 +588,35 @@ func (a *Agent) SetGate(g Gate) {
 		g = nil
 	}
 	a.gate = g
+}
+
+// SetRecoveryGate installs Auto Guard. Safe to call before the run loop starts;
+// nil disables its checks.
+func (a *Agent) SetRecoveryGate(g RecoveryGate) {
+	if a == nil {
+		return
+	}
+	if nilutil.IsNil(g) {
+		g = nil
+	}
+	a.recoveryGate = g
+}
+
+// SetRecoveryIdentity sets the agent/task labels used on recovery cards.
+func (a *Agent) SetRecoveryIdentity(agentID, taskID string) {
+	if a == nil {
+		return
+	}
+	a.recoveryAgentID = strings.TrimSpace(agentID)
+	a.recoveryTaskID = strings.TrimSpace(taskID)
+}
+
+// RecoveryGate returns the attached Auto Guard (may be nil).
+func (a *Agent) RecoveryGate() RecoveryGate {
+	if a == nil {
+		return nil
+	}
+	return a.recoveryGate
 }
 
 // SetPlanModeReadOnlyTrustGate retains the legacy confirmation bridge for old
@@ -816,6 +877,11 @@ type Options struct {
 	// so a stale collaboration flag cannot authorize a dynamic writer target.
 	ReadOnlyExecution bool
 
+	// PlannerMCPExecution enables Planner-trusted MCP through use_capability:
+	// authorized, non-destructive tools may run without readOnlyHint. Only
+	// NewPlannerAgent sets this; strict read-only sub-agents must not.
+	PlannerMCPExecution bool
+
 	// PlanModeReadOnlyTrustGate is retained for legacy controller compatibility.
 	// The main Plan execution path no longer invokes it.
 	PlanModeReadOnlyTrustGate PlanModeReadOnlyTrustGate
@@ -845,6 +911,14 @@ type Options struct {
 
 	// Jobs is the session's background-job manager (nil disables background tools).
 	Jobs *jobs.Manager
+
+	// WriteScheduler is the session-scoped subagent concurrency/write-claim
+	// controller. When set on the parent executor, write-capable tools reserve
+	// paths for the duration of Execute so background writers cannot TOCTOU
+	// race parent writes. Subagents leave this nil (or depth > 0 skips it).
+	WriteScheduler *SubagentScheduler
+	// WriteWorkspaceRoot normalizes parent write reservations.
+	WriteWorkspaceRoot string
 
 	// WorkspaceLease serializes Delivery mutations across sessions that target
 	// the same workspace. nil preserves source compatibility for direct Agent
@@ -885,13 +959,18 @@ type Options struct {
 	// user-turn context. Empty/auto keeps the stable same-as-user policy.
 	ResponseLanguage string
 
-	// PlanModeAllowedTools is retained for source compatibility. MCP assembly may
-	// still translate legacy entries into local read-only trust, but it does not
-	// grant or revoke calls in the main Plan workflow.
-	PlanModeAllowedTools []string
 	// PlanModeReadOnlyCommands is retained for old config/controller data. Main
 	// Plan execution classifies bash through Permissions instead.
 	PlanModeReadOnlyCommands []string
+
+	// RecoveryGate is the optional Auto Guard boundary. It checks deterministic
+	// high-risk mutations and failure recovery before permission approval and
+	// write-lock acquisition.
+	RecoveryGate RecoveryGate
+	// RecoveryAgentID labels this agent on recovery cards (empty = root).
+	RecoveryAgentID string
+	// RecoveryTaskID isolates recovery state for this agent (empty = root task).
+	RecoveryTaskID string
 
 	// SubagentDepth is the current nesting depth for this agent. Root sessions are
 	// depth 0; child subagents are depth 1. MaxSubagentDepth caps delegation.
@@ -970,12 +1049,18 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		usageSource:           usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
 		sink:                  sink,
 		gate:                  gate,
+		recoveryGate:          opts.RecoveryGate,
+		recoveryAgentID:       strings.TrimSpace(opts.RecoveryAgentID),
+		recoveryTaskID:        strings.TrimSpace(opts.RecoveryTaskID),
 		readOnlyExecution:     opts.ReadOnlyExecution,
+		plannerMCPExecution:   opts.PlannerMCPExecution,
 		planModeReadOnlyTrust: planModeReadOnlyTrust,
 		sandboxEscapeApprover: sandboxEscapeApprover,
 		configWriteApprover:   configWriteApprover,
 		hooks:                 hooks,
 		jobs:                  opts.Jobs,
+		writeScheduler:        opts.WriteScheduler,
+		writeWorkspaceRoot:    strings.TrimSpace(opts.WriteWorkspaceRoot),
 		workspaceLease:        opts.WorkspaceLease,
 		evidence:              evidence.NewLedger(),
 		projectChecks:         append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
@@ -1007,6 +1092,25 @@ func usageSourceOrDefault(source, fallback string) string {
 	return fallback
 }
 
+// reserveParentWrite holds write claims for the duration of a parent-agent
+// write tool call. Returns a no-op release when reservation is not needed
+// (subagent, read-only, no scheduler, or non-write tool).
+func (a *Agent) reserveParentWrite(runTool tool.Tool, args json.RawMessage, readOnly bool) (release func(), err error) {
+	noop := func() {}
+	if a == nil || a.writeScheduler == nil || a.subagentDepth > 0 || readOnly || runTool == nil {
+		return noop, nil
+	}
+	name := runTool.Name()
+	if !parentWriteGuardTarget(name) {
+		return noop, nil
+	}
+	claim, err := parentWriteReservation(a.writeWorkspaceRoot, name, args)
+	if err != nil {
+		return noop, err
+	}
+	return a.writeScheduler.ReserveParentWrite(claim)
+}
+
 // Run appends the user input and drives the tool loop until the model returns a
 // final answer (no tool calls), the context is cancelled, or the provider errors.
 // With maxSteps <= 0 the loop is unbounded — the natural termination is the model
@@ -1014,6 +1118,7 @@ func usageSourceOrDefault(source, fallback string) string {
 // a round count. A positive maxSteps imposes an optional hard guard, surfaced as
 // a resumable notice when hit.
 func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
+	a.recoveryRunSeq.Add(1)
 	if a.deliveryProfile && a.workspaceLease != nil {
 		a.workspaceLease.BeginRun()
 		defer a.workspaceLease.EndRun()
@@ -1115,13 +1220,21 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	}
 	a.deliveryTaskExpected = deliveryTaskNeedsEvidence(classifierInput)
 	a.deliveryMutationExpected = deliveryTaskNeedsMutation(classifierInput) && registryHasWriterTools(a.tools)
+	a.recoveryTaskSummary = boundedRecoveryTaskSummary(classifierInput)
+	// A cancelled/error turn leaves a provider-excluded recovery record at the
+	// transcript tail. Fold its bounded facts into this new user turn exactly
+	// once; the user's raw text remains the classifier source above.
+	rawInput = withInterruptedRecovery(rawInput, a.pendingInterruptedRecovery())
 	a.repeatSuccessCounts = nil
 	a.blockedTurnStreak = 0
 	a.loopGuardArmed = false
 	a.loopGuardReceiptMark = 0
 	a.sink.Emit(event.Event{Kind: event.TurnStarted})
 	input = a.withTurnPreferences(rawInput)
-	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input, Images: userImages(ctx), CreatedAt: time.Now().UnixMilli()})
+	userCreatedAt := time.Now().UnixMilli()
+	a.activeTurnCreatedAt.Store(userCreatedAt)
+	defer a.activeTurnCreatedAt.Store(0)
+	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input, Images: userImages(ctx), CreatedAt: userCreatedAt})
 
 	finalReadinessBlocks := 0
 	seenReadinessStates := make(map[string]struct{})
@@ -1130,6 +1243,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	usedAnyTool := false
 	streamRecoveries := 0
 	graceRound := false
+	recoveryGraceRound := false
 	todoProgress, trackingTodoProgress := a.canonicalTodoProgress()
 	todoStallRounds := 0
 	seenTodoProgress := make(map[string]struct{})
@@ -1139,7 +1253,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		}
 	}
 	executorHandoff := a.executorHandoffGuard && strings.Contains(input, executorHandoffMarker)
-	for step := 0; a.maxSteps <= 0 || step < a.maxSteps || graceRound; step++ {
+	for step := 0; a.maxSteps <= 0 || step < a.maxSteps || graceRound || recoveryGraceRound; step++ {
 		// Consume a queued steer and persist it to the session so it
 		// survives tab switches and history replay. The model sees it as
 		// guidance (with a prefix), not a new task. One cache miss per
@@ -1155,19 +1269,11 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 			prevPrefixShape = prefixShape
 		}
 
-		text, reasoning, signature, calls, usage, interrupted, partialToolStarted, err := a.stream(ctx, step+1)
+		text, reasoning, signature, calls, usage, interrupted, partialToolStarted, partialCalls, err := a.stream(ctx, step+1)
 		if err != nil {
 			if interrupted && streamRecoveries < maxStreamRecoveries {
 				streamRecoveries++
-				if hasVisibleFinalAnswer(text) {
-					a.session.Add(provider.Message{
-						Role:               provider.RoleAssistant,
-						Content:            text,
-						ReasoningContent:   reasoning,
-						ReasoningSignature: signature,
-						WorkDurationMs:     workDurationMs(),
-					})
-				}
+				a.recordInterruptedDisplay(text, reasoning, partialCalls, false, workDurationMs())
 				a.session.Add(provider.Message{
 					Role:    provider.RoleUser,
 					Content: a.withTurnPreferences(streamRecoveryMessage(hasVisibleFinalAnswer(text), partialToolStarted)),
@@ -1176,6 +1282,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				step-- // recovery retries do not consume the tool-round maxSteps budget
 				continue
 			}
+			a.recordInterruptedDisplay(text, reasoning, partialCalls, true, workDurationMs())
 			return err
 		}
 		streamRecoveries = 0
@@ -1208,6 +1315,20 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		})
 
 		if len(calls) == 0 {
+			// Recovery finalization produced a summary. Keep it in the session,
+			// but still pause so Goal auto-continue cannot open another Run with
+			// a fresh finalization round. turn_done reports recovery_paused.
+			if recoveryGraceRound {
+				a.maybeCompact(ctx, usage)
+				reason := ""
+				if ctrl := a.recoveryEpisodeControl(); ctrl != nil {
+					_, _ = ctrl.ConsumeFinalization(a.recoveryTaskID)
+				}
+				return &RecoveryPauseError{
+					Message:    "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send \"continue\" to start a fresh attempt, or add instructions to change direction.",
+					StopReason: reason,
+				}
+			}
 			finalizeTask := !a.deliveryScopeActive || deliveryDisposition(text) == deliveryGoalFinal
 			readiness := a.finalReadinessCheckFor(finalizeTask)
 			if graceRound && (readiness.reason != "" || !hasVisibleFinalAnswer(text)) {
@@ -1240,14 +1361,24 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				continue
 			}
 			if !hasVisibleFinalAnswer(text) {
-				emptyFinalBlocks++
-				if emptyFinalBlocks >= maxEmptyFinalBlocks {
-					return fmt.Errorf("model finished without a visible final answer %d times", emptyFinalBlocks)
+				// DeepSeek thinking mode can stream a long reasoning_content and
+				// then finish with finish_reason="stop" but an empty content
+				// block: the model has explicitly signalled completion and its
+				// reasoning was already streamed to the user. Retrying here overrides
+				// that stop signal and forces another expensive thinking round (the
+				// "still thinking after the task is done" symptom), so honour the
+				// stop when reasoning carried the substance of the answer and treat
+				// the turn as a final answer instead of retrying.
+				if !reasoningOnlyFinishHonoured(a.prov, usage, reasoning) {
+					emptyFinalBlocks++
+					if emptyFinalBlocks >= maxEmptyFinalBlocks {
+						return fmt.Errorf("model finished without a visible final answer %d times", emptyFinalBlocks)
+					}
+					a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeEmptyFinal, Text: emptyFinalNotice(), Detail: emptyFinalNoticeDetail(a.prov.Name(), usage, len(reasoning))})
+					a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withTurnPreferences(emptyFinalRetryMessage())})
+					a.maybeCompact(ctx, usage)
+					continue
 				}
-				a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeEmptyFinal, Text: emptyFinalNotice(), Detail: emptyFinalNoticeDetail(a.prov.Name(), usage, len(reasoning))})
-				a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withTurnPreferences(emptyFinalRetryMessage())})
-				a.maybeCompact(ctx, usage)
-				continue
 			}
 			if executorHandoff && !usedAnyTool && handoffNudges < maxExecutorHandoffNudges && shouldNudgeExecutorHandoff(input, text) {
 				handoffNudges++
@@ -1276,12 +1407,37 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		if graceRound {
 			return &maxStepsPause{steps: a.maxSteps, key: a.maxStepsKey}
 		}
+		// Recovery Episode exhausted: one finalization round only. Further tool
+		// calls are not executed; return a typed pause so the host can surface
+		// recovery_paused without treating it as a send failure.
+		if recoveryGraceRound {
+			reason := ""
+			if ctrl := a.recoveryEpisodeControl(); ctrl != nil {
+				_, _ = ctrl.ConsumeFinalization(a.recoveryTaskID)
+			}
+			// Pair tool-call / tool-result without executing.
+			msg := "blocked: Auto recovery already paused this turn. Do not call tools; the user will continue in the next message."
+			for _, call := range calls {
+				a.session.Add(provider.Message{
+					Role:       provider.RoleTool,
+					Content:    msg,
+					ToolCallID: call.ID,
+					Name:       call.Name,
+				})
+			}
+			a.maybeCompact(ctx, usage)
+			return &RecoveryPauseError{
+				Message:    "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send \"continue\" to start a fresh attempt, or add instructions to change direction.",
+				StopReason: reason,
+			}
+		}
 
 		receiptMark := 0
 		if a.evidence != nil {
 			receiptMark = a.evidence.Len()
 		}
-		results, images := a.executeBatch(ctx, calls)
+		batch := a.executeBatch(ctx, calls)
+		results, images := batch.results, batch.images
 		for i, call := range calls {
 			a.session.Add(provider.Message{
 				Role:       provider.RoleTool,
@@ -1294,6 +1450,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		// If the context was cancelled during tool execution, return after storing
 		// the batch results so the session keeps paired tool-call history.
 		if ctx.Err() != nil {
+			a.recordInterruptedDisplay("", "", nil, true, workDurationMs())
 			return ctx.Err()
 		}
 		if !a.planMode.Load() {
@@ -1338,6 +1495,19 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		// The prompt only grows from here; compact before the next turn so it
 		// stays within the model's window.
 		a.maybeCompact(ctx, usage)
+
+		// When Auto recovery exhausts its Episode budget, offer exactly one
+		// summarize-only finalization round. Successful summary ends cleanly;
+		// further tool calls surface RecoveryPauseError.
+		if batch.recoveryStopTurn && !recoveryGraceRound {
+			recoveryGraceRound = true
+			if ctrl := a.recoveryEpisodeControl(); ctrl != nil {
+				ctrl.MarkFinalizationOffered(a.recoveryTaskID)
+			}
+			nudge := "Auto recovery has reached its limit for this turn. Do not call any more tools. Summarize what was completed, what failed, and what the user should do next. The user can continue in the next message."
+			a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withTurnPreferences(nudge)})
+			continue
+		}
 
 		// When the tool-call budget runs out this round, give the model
 		// one grace round to produce a final answer from completed work.
@@ -2136,6 +2306,28 @@ func hasVisibleFinalAnswer(text string) bool {
 	return strings.TrimSpace(text) != ""
 }
 
+// reasoningOnlyFinishHonoured reports whether the model finished with a stop
+// signal but placed its answer in the reasoning stream rather than the content
+// block. DeepSeek thinking mode does this occasionally: it streams a long
+// reasoning_content, then returns finish_reason="stop" with an empty content.
+// The model has signalled completion, so the host accepts the turn instead of
+// retrying and forcing another expensive thinking round.
+//
+// The accept is scoped to DeepSeek thinking mode (ToolCallReasoningPolicy):
+// for other providers a reasoning-only turn keeps the empty-final retry
+// safety net — local <think>-tag models often recover a visible answer on
+// the second attempt, and a gateway that mislabels truncation as "stop"
+// must not have a degenerate turn committed as the final answer.
+func reasoningOnlyFinishHonoured(p provider.Provider, u *provider.Usage, reasoning string) bool {
+	if !provider.RequiresToolCallReasoning(p) {
+		return false
+	}
+	if u == nil || u.FinishReason != "stop" {
+		return false
+	}
+	return strings.TrimSpace(reasoning) != ""
+}
+
 func emptyFinalRetryMessage() string {
 	return "The previous assistant response finished without any visible answer text. Continue the same task now and provide a concise visible answer to the user. Do not send reasoning only."
 }
@@ -2165,7 +2357,7 @@ func streamRecoveryMessage(hasPartialText, hadPartialTool bool) string {
 	case hadPartialTool:
 		return "The previous assistant response was interrupted while a tool call was streaming. Continue the same task now. If a tool is still needed, issue a fresh complete tool call from scratch; do not rely on any partial tool-call arguments from the interrupted stream."
 	case hasPartialText:
-		return "The previous assistant response was interrupted during streaming. Continue the same task from immediately after the partial assistant message above. Do not repeat text that is already visible."
+		return "The previous assistant response was interrupted during streaming. Continue the same task now. Partial text remains visible to the user but was excluded from model context; avoid needlessly repeating it, and do not assume it was complete."
 	default:
 		return "The previous assistant response was interrupted during streaming before visible answer text was completed. Continue the same task now and provide the next useful response."
 	}
@@ -2176,14 +2368,14 @@ func streamRecoveryMessage(hasPartialText, hadPartialTool bool) string {
 // stream so a sink can re-render the streamed raw text as styled markdown. The
 // accumulated text and reasoning are also returned so the caller can round-trip
 // reasoning on the next turn.
-func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, []provider.ToolCall, *provider.Usage, bool, bool, error) {
+func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, []provider.ToolCall, *provider.Usage, bool, bool, []provider.ToolCall, error) {
 	ctx = provider.WithRetryNotify(ctx, func(info provider.RetryInfo) {
 		a.sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: info.Attempt, RetryMax: info.Max})
 	})
 	// CreatedAt is durable UI metadata, not model input. Strip it from the
 	// transport copy so wall-clock differences never invalidate the provider's
 	// prompt-cache prefix (and custom providers cannot accidentally send it).
-	requestMessages := append([]provider.Message(nil), a.session.Messages...)
+	requestMessages := append([]provider.Message(nil), provider.ModelMessages(a.session.Messages)...)
 	for i := range requestMessages {
 		requestMessages[i].CreatedAt = 0
 	}
@@ -2193,7 +2385,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		Temperature: provider.OptionalTemperature(a.temperature),
 	})
 	if err != nil {
-		return "", "", "", nil, nil, false, false, err
+		return "", "", "", nil, nil, false, false, nil, err
 	}
 
 	// A PostLLMCall hook rewrites the whole reasoning block, so when one is wired
@@ -2205,6 +2397,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 	var text, reasoning strings.Builder
 	var signature string // provider-issued proof for the reasoning (Anthropic thinking)
 	var calls []provider.ToolCall
+	var partialCalls []provider.ToolCall
 	var usage *provider.Usage
 	var partialToolStarted bool
 	var lastArgProgress time.Time
@@ -2228,12 +2421,12 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		select {
 		case <-ctx.Done():
 			stored, _ := finishReasoning()
-			return text.String(), stored, signature, calls, usage, false, partialToolStarted, ctx.Err()
+			return text.String(), stored, signature, calls, usage, false, partialToolStarted, partialCalls, ctx.Err()
 		case c, ok := <-ch:
 			if !ok {
 				if err := ctx.Err(); err != nil {
 					stored, _ := finishReasoning()
-					return text.String(), stored, signature, calls, usage, false, partialToolStarted, err
+					return text.String(), stored, signature, calls, usage, false, partialToolStarted, partialCalls, err
 				}
 				stored, display := finishReasoning()
 				if text.Len() > 0 || display != "" {
@@ -2243,7 +2436,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 						Reasoning: display,
 					})
 				}
-				return text.String(), stored, signature, calls, usage, false, false, nil
+				return text.String(), stored, signature, calls, usage, false, false, partialCalls, nil
 			}
 			chunk = c
 		}
@@ -2266,6 +2459,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 			// working instead of a stall. executeBatch emits the full dispatch
 			// (with args) once the call completes; the frontend merges by ID.
 			if tc := chunk.ToolCall; tc != nil {
+				partialCalls = upsertPartialToolCall(partialCalls, *tc)
 				a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
 					ID: tc.ID, Name: tc.Name, ReadOnly: a.toolReadOnly(tc.Name), Partial: true,
 				}})
@@ -2277,6 +2471,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 			// UI can show progress instead of a dead counter for the duration of
 			// a 30KB write_file body.
 			if tc := chunk.ToolCall; tc != nil && time.Since(lastArgProgress) >= 250*time.Millisecond {
+				partialCalls = upsertPartialToolCall(partialCalls, *tc)
 				lastArgProgress = time.Now()
 				a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
 					ID: tc.ID, Name: tc.Name, ReadOnly: a.toolReadOnly(tc.Name), Partial: true, ArgChars: chunk.ArgChars,
@@ -2284,7 +2479,10 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 			}
 		case provider.ChunkToolCall:
 			partialToolStarted = true
-			calls = append(calls, *chunk.ToolCall)
+			if chunk.ToolCall != nil {
+				calls = append(calls, *chunk.ToolCall)
+				partialCalls = upsertPartialToolCall(partialCalls, *chunk.ToolCall)
+			}
 		case provider.ChunkUsage:
 			usage = chunk.Usage
 			a.lastUsage.Store(chunk.Usage)
@@ -2293,11 +2491,56 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		case provider.ChunkError:
 			if provider.IsStreamInterrupted(chunk.Err) {
 				stored, _ := finishReasoning()
-				return text.String(), stored, signature, calls, usage, true, partialToolStarted, chunk.Err
+				return text.String(), stored, signature, calls, usage, true, partialToolStarted, partialCalls, chunk.Err
 			}
-			return "", "", "", nil, nil, false, false, chunk.Err
+			stored, _ := finishReasoning()
+			return text.String(), stored, signature, calls, usage, false, partialToolStarted, partialCalls, chunk.Err
 		}
 	}
+}
+
+func upsertPartialToolCall(calls []provider.ToolCall, call provider.ToolCall) []provider.ToolCall {
+	for i := range calls {
+		if call.ID != "" && calls[i].ID == call.ID {
+			calls[i] = call
+			return calls
+		}
+	}
+	return append(calls, call)
+}
+
+func (a *Agent) recordInterruptedDisplay(text, reasoning string, calls []provider.ToolCall, pending bool, workDurationMs int64) {
+	displayCalls := make([]provider.ToolCall, 0, len(calls))
+	interrupted := make([]string, 0, len(calls))
+	seen := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		key := call.ID + "\x00" + name
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		displayCalls = append(displayCalls, provider.ToolCall{ID: call.ID, Name: name})
+		if name != "" {
+			interrupted = append(interrupted, name)
+		}
+	}
+	a.session.Add(provider.Message{
+		Role:             provider.RoleTool,
+		Content:          text,
+		ReasoningContent: reasoning,
+		ToolCalls:        displayCalls,
+		ToolCallID:       provider.LocalOnlyToolID,
+		Name:             provider.LocalOnlyToolName,
+		WorkDurationMs:   workDurationMs,
+		LocalOnly:        true,
+		InterruptedTurn: &provider.InterruptedTurnRecovery{
+			Pending:                 pending,
+			InterruptedTools:        interrupted,
+			DroppedPartialText:      strings.TrimSpace(text) != "",
+			DroppedPartialReasoning: strings.TrimSpace(reasoning) != "",
+		},
+	})
 }
 
 func (a *Agent) capturePrefixShape(schemas []provider.ToolSchema) PrefixShape {
@@ -2318,15 +2561,22 @@ func (a *Agent) systemPrompt() string {
 	return b.String()
 }
 
+// batchExecution is the result of one provider tool-call batch.
+type batchExecution struct {
+	results            []string
+	images             [][]string
+	recoveryStopTurn   bool
+	recoveryStopReason string
+}
+
 // executeBatch dispatches one model turn's tool calls. A ToolDispatch event is
 // emitted for every call up front, in call order, so a frontend can show the
 // timeline chronologically. Contiguous known ReadOnly calls fan out across
 // goroutines; unknown and writer calls run as single-call serial segments so
 // write/read ordering stays provider-ordered. ToolResult events are emitted
 // after the batch in call order, so emission stays serial even when execution
-// parallelised. The second return carries each call's tool-result images (nil
-// for most calls), aligned by index with the first.
-func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]string, [][]string) {
+// parallelised. Images are aligned by index with results.
+func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) batchExecution {
 	// The assistant message already stored this slice in Session. Keep execution
 	// state separate so refreshing a dependent preview never mutates shared
 	// session memory outside Session's lock.
@@ -2352,9 +2602,12 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 	// commands and filesystem calls can mutate disk before reporting an error.
 	// The first writer stays on the single-preview fast path.
 	earlierWriterRan := false
+	surfaceWriters := make([]bool, len(calls))
 	run := func(i int) {
-		t, known := a.tools.Get(calls[i].Name)
+		t, _, ambiguous := a.tools.ResolveCall(calls[i].Name)
+		known := t != nil && len(ambiguous) == 0
 		writer := known && !t.ReadOnly()
+		surfaceWriters[i] = writer
 		if earlierWriterRan && writer {
 			if refreshed, changed := refreshCurrentFileDiff(t, calls[i]); changed {
 				calls[i] = refreshed
@@ -2374,12 +2627,24 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 			return
 		}
 		outcomes[i] = a.executeOne(ctx, calls[i])
+		if outcomes[i].resolved {
+			readOnly := outcomes[i].resolvedReadOnly
+			calls[i].ResolvedName = outcomes[i].resolvedName
+			calls[i].CapabilityID = outcomes[i].capabilityID
+			calls[i].ResolvedReadOnly = &readOnly
+		}
 		if calls[i].Name == "complete_step" && outcomes[i].errMsg == "" {
 			completedStepInBatch = true
 		}
 		durations[i] = time.Since(start).Milliseconds()
 		results[i] = outcomes[i].output
-		if writer {
+	}
+	finalize := func(i int) {
+		if calls[i].ResolvedReadOnly != nil {
+			a.session.UpdateToolCallResolution(calls[i])
+			a.emitResolvedToolDispatch(calls[i])
+		}
+		if surfaceWriters[i] || (outcomes[i].resolved && !outcomes[i].resolvedReadOnly) {
 			earlierWriterRan = true
 		}
 	}
@@ -2397,18 +2662,61 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 		cancelled = true
 	}
 
+	// recoveryBatchStop blocks remaining tools after Episode budgets are
+	// exhausted so tool-call / result pairs stay complete for the provider.
+	recoveryBatchStop := false
+	recoveryStopReason := ""
+	markRecoveryStopped := func(start int, reason string) {
+		msg := "blocked: Auto recovery paused this turn; do not call more tools. Summarize completed work for the user."
+		for j := start; j < len(calls); j++ {
+			if results[j] != "" {
+				continue
+			}
+			results[j] = msg
+			outcomes[j] = toolOutcome{
+				output:             msg,
+				blocked:            true,
+				errMsg:             firstLine(msg),
+				recoveryStopTurn:   true,
+				recoveryStopReason: reason,
+			}
+		}
+		recoveryBatchStop = true
+		if reason != "" {
+			recoveryStopReason = reason
+		}
+	}
+
 	for _, batch := range partitionToolCalls(a.tools, calls) {
 		if ctx.Err() != nil {
 			markCancelled(batch.start)
 			break
 		}
+		if recoveryBatchStop {
+			markRecoveryStopped(batch.start, recoveryStopReason)
+			break
+		}
 		if batch.parallel && batch.end-batch.start > 1 {
 			ranUntil := runParallel(ctx, batch.start, batch.end, run)
+			for i := batch.start; i < ranUntil; i++ {
+				finalize(i)
+			}
 			// After parallel execution completes, check if context was cancelled.
 			// The individual tool executions should have detected ctx.Done(), but
 			// we verify here to ensure we don't continue to subsequent batches.
 			if ctx.Err() != nil {
 				markCancelled(ranUntil)
+				break
+			}
+			for i := batch.start; i < batch.end; i++ {
+				if outcomes[i].recoveryStopTurn {
+					recoveryBatchStop = true
+					recoveryStopReason = outcomes[i].recoveryStopReason
+					markRecoveryStopped(batch.end, recoveryStopReason)
+					break
+				}
+			}
+			if recoveryBatchStop {
 				break
 			}
 			continue
@@ -2421,7 +2729,18 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 				markCancelled(i)
 				break
 			}
+			if recoveryBatchStop {
+				markRecoveryStopped(i, recoveryStopReason)
+				break
+			}
 			run(i)
+			finalize(i)
+			if outcomes[i].recoveryStopTurn {
+				recoveryBatchStop = true
+				recoveryStopReason = outcomes[i].recoveryStopReason
+				markRecoveryStopped(i+1, recoveryStopReason)
+				break
+			}
 			// After each tool execution, also check if the context was cancelled.
 			// If so, stop executing remaining tools and return immediately so
 			// the agent loop can detect the cancellation and exit.
@@ -2430,23 +2749,30 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 				break
 			}
 		}
-		if cancelled {
+		if cancelled || recoveryBatchStop {
 			break
 		}
 	}
 
 	for i, c := range calls {
 		o := outcomes[i]
-		t, ok := a.tools.Get(c.Name)
+		t, _, ambiguous := a.tools.ResolveCall(c.Name)
+		ok := t != nil && len(ambiguous) == 0
+		readOnly := ok && t.ReadOnly()
+		if c.ResolvedReadOnly != nil {
+			readOnly = *c.ResolvedReadOnly
+		}
 		a.sink.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{
-			ID:         c.ID,
-			Name:       c.Name,
-			Args:       c.Arguments,
-			Output:     o.output,
-			Err:        o.errMsg,
-			ReadOnly:   ok && t.ReadOnly(),
-			Truncated:  o.truncated,
-			DurationMs: durations[i],
+			ID:           c.ID,
+			Name:         c.Name,
+			Args:         c.Arguments,
+			ResolvedName: c.ResolvedName,
+			CapabilityID: c.CapabilityID,
+			Output:       o.output,
+			Err:          o.errMsg,
+			ReadOnly:     readOnly,
+			Truncated:    o.truncated,
+			DurationMs:   durations[i],
 		}})
 		if o.truncated && o.truncMsg != "" {
 			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: o.truncMsg})
@@ -2458,12 +2784,24 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 	images := make([][]string, len(calls))
 	for i := range outcomes {
 		images[i] = outcomes[i].images
+		if outcomes[i].recoveryStopTurn {
+			recoveryBatchStop = true
+			if outcomes[i].recoveryStopReason != "" {
+				recoveryStopReason = outcomes[i].recoveryStopReason
+			}
+		}
 	}
-	return results, images
+	return batchExecution{
+		results:            results,
+		images:             images,
+		recoveryStopTurn:   recoveryBatchStop,
+		recoveryStopReason: recoveryStopReason,
+	}
 }
 
 func (a *Agent) emitFullToolDispatch(c provider.ToolCall, refreshed bool) {
-	t, ok := a.tools.Get(c.Name)
+	t, _, ambiguous := a.tools.ResolveCall(c.Name)
+	ok := t != nil && len(ambiguous) == 0
 	ev := event.Tool{ID: c.ID, Name: c.Name, Args: c.Arguments, ReadOnly: ok && t.ReadOnly(), Refreshed: refreshed}
 	ev.FileDiff = event.FileDiff{Diff: c.Diff, Added: c.Added, Removed: c.Removed}
 	if ok && ev.Diff == "" && ev.Added == 0 && ev.Removed == 0 {
@@ -2479,6 +2817,34 @@ func (a *Agent) emitFullToolDispatch(c provider.ToolCall, refreshed bool) {
 		}
 	}
 	a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: ev})
+}
+
+// emitResolvedToolDispatch upserts the real target classification of a stable
+// proxy call without changing the provider-visible Name/Args. Append-only sinks
+// ignore Refreshed events; stateful frontends replace the existing card by ID.
+func (a *Agent) emitResolvedToolDispatch(c provider.ToolCall) {
+	if c.ResolvedReadOnly == nil {
+		return
+	}
+	if c.ResolvedName != "" && c.ResolvedName != c.Name {
+		EmitProxyAudit(a.sink, tool.ResolvedCall{
+			DisplayName:  c.Name,
+			TargetName:   c.ResolvedName,
+			CapabilityID: c.CapabilityID,
+		})
+	}
+	a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
+		ID:           c.ID,
+		Name:         c.Name,
+		Args:         c.Arguments,
+		ResolvedName: c.ResolvedName,
+		CapabilityID: c.CapabilityID,
+		ReadOnly:     *c.ResolvedReadOnly,
+		Refreshed:    true,
+		FileDiff: event.FileDiff{
+			Diff: c.Diff, Added: c.Added, Removed: c.Removed,
+		},
+	}})
 }
 
 // refreshCurrentFileDiff recomputes a writer preview against the state left by
@@ -2513,7 +2879,8 @@ func (a *Agent) withPreviewFileDiffs(calls []provider.ToolCall) []provider.ToolC
 		if out[i].Diff != "" || out[i].Added != 0 || out[i].Removed != 0 {
 			continue
 		}
-		t, ok := a.tools.Get(out[i].Name)
+		t, _, ambiguous := a.tools.ResolveCall(out[i].Name)
+		ok := t != nil && len(ambiguous) == 0
 		if !ok {
 			continue
 		}
@@ -2538,7 +2905,9 @@ type toolCallBatch struct {
 // complete_step and todo_write read the turn's evidence ledger. wait and
 // bash_output can merge a background task's receipts into that ledger. These
 // evidence-sensitive tools never join a parallel run, so provider order stays
-// receipt order.
+// receipt order. use_capability is always serial because its provider-visible
+// read-only surface can resolve to a real MCP writer only inside executeOne;
+// batching it as a reader would let multiple database/API mutations race.
 func partitionToolCalls(r *tool.Registry, calls []provider.ToolCall) []toolCallBatch {
 	var batches []toolCallBatch
 	for i := 0; i < len(calls); {
@@ -2559,11 +2928,11 @@ func partitionToolCalls(r *tool.Registry, calls []provider.ToolCall) []toolCallB
 
 func parallelisable(r *tool.Registry, name string) bool {
 	switch name {
-	case "complete_step", "todo_write", "wait", "bash_output":
+	case "complete_step", "todo_write", "wait", "bash_output", "use_capability":
 		return false
 	}
-	t, ok := r.Get(name)
-	return ok && t.ReadOnly()
+	t, _, ambiguous := r.ResolveCall(name)
+	return t != nil && len(ambiguous) == 0 && t.ReadOnly()
 }
 
 func runParallel(ctx context.Context, start, end int, run func(int)) int {
@@ -2758,20 +3127,71 @@ func batchStormSignature(calls []provider.ToolCall, outcomes []toolOutcome) (str
 // data URLs from a tool.ImageTool result; they ride outside output so text
 // truncation can never corrupt an image payload.
 type toolOutcome struct {
-	output    string
-	images    []string
-	blocked   bool
-	errMsg    string
-	truncated bool
-	truncMsg  string
+	output           string
+	images           []string
+	blocked          bool
+	errMsg           string
+	truncated        bool
+	truncMsg         string
+	resolved         bool
+	resolvedName     string
+	capabilityID     string
+	resolvedReadOnly bool
+	// recoveryGeneration is the gate generation captured before execution so
+	// ObserveResult can ignore stale results after a mode switch.
+	recoveryGeneration uint64
+	// recoveryStopTurn is set when Auto Episode budgets are exhausted.
+	recoveryStopTurn   bool
+	recoveryStopReason string
+}
+
+// completedMCPConnect recognizes a synthetic cache-miss connect call whose
+// background discovery finished after the provider request was serialized. The
+// connect placeholder is intentionally absent once real tools replace it, but
+// the already-advertised call still completed its only job and must not surface
+// as an unknown tool.
+func completedMCPConnect(reg *tool.Registry, name string) (string, bool) {
+	server, rawName, ok := tool.SplitMCPName(name)
+	if !ok || rawName != "connect" {
+		return "", false
+	}
+	prefix := tool.MCPNamePrefix + server + "__"
+	for _, current := range reg.Names() {
+		if current != name && strings.HasPrefix(current, prefix) {
+			return server, true
+		}
+	}
+	return "", false
 }
 
 // executeOne runs a single tool call. It is pure with respect to the event sink
 // — the caller emits ToolDispatch/ToolResult — so it is safe to invoke from
 // parallel goroutines.
-func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutcome {
-	t, ok := a.tools.Get(call.Name)
-	if !ok {
+func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) (out toolOutcome) {
+	var resolvedMeta *tool.ResolvedCall
+	defer func() {
+		if resolvedMeta == nil {
+			return
+		}
+		out.resolved = true
+		out.resolvedName = resolvedMeta.TargetName
+		out.capabilityID = resolvedMeta.CapabilityID
+		out.resolvedReadOnly = resolvedMeta.ReadOnly
+	}()
+	t, canonicalName, ambiguous := a.tools.ResolveCall(call.Name)
+	if len(ambiguous) > 0 {
+		msg := fmt.Sprintf("ambiguous MCP tool reference %q; use one of: %s", call.Name, strings.Join(ambiguous, ", "))
+		return toolOutcome{
+			output: "error: " + msg,
+			errMsg: msg,
+		}
+	}
+	if t == nil {
+		if server, ok := completedMCPConnect(a.tools, call.Name); ok {
+			return toolOutcome{
+				output: fmt.Sprintf("MCP server %q is connected; its real tools are now available", server),
+			}
+		}
 		return toolOutcome{
 			output: fmt.Sprintf("error: unknown tool %q", call.Name),
 			errMsg: fmt.Sprintf("unknown tool %q", call.Name),
@@ -2802,7 +3222,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				safety = planmode.PlanSafetyUnsafe
 			}
 		}
-		if decision := a.planModeDecision(call.Name, t.ReadOnly(), planModeUntrustedReadOnly(t), safety, json.RawMessage(call.Arguments)); decision.Blocked {
+		if decision := a.planModeDecision(canonicalName, t.ReadOnly(), safety, json.RawMessage(call.Arguments)); decision.Blocked {
 			return toolOutcome{
 				output:  decision.Message,
 				blocked: true,
@@ -2812,11 +3232,11 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	}
 	// Resolve proxy tools (use_capability) to the real MCP target before
 	// permission, hooks, and evidence. Provider transcript keeps call.Name.
-	permName := call.Name
+	permName := canonicalName
 	permArgs := json.RawMessage(call.Arguments)
 	execTool := t
 	execArgs := json.RawMessage(call.Arguments)
-	evidenceName := call.Name
+	evidenceName := canonicalName
 	evidenceArgs := json.RawMessage(call.Arguments)
 	readOnly := t.ReadOnly()
 	var resolved tool.ResolvedCall
@@ -2829,6 +3249,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			}
 		}
 		resolved = rc
+		resolvedMeta = &resolved
 		if rc.TargetName != "" {
 			permName = rc.TargetName
 			evidenceName = rc.TargetName
@@ -2842,9 +3263,6 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			execTool = rc.Target
 		}
 		readOnly = rc.ReadOnly
-		if rc.TargetName != "" && rc.TargetName != call.Name {
-			EmitProxyAudit(a.sink, rc)
-		}
 		if outcome, blocked := a.readOnlyExecutionBlock(t, &rc); blocked {
 			return outcome
 		}
@@ -2892,7 +3310,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				safety = planmode.PlanSafetyUnsafe
 			}
 		}
-		if decision := a.planModeDecision(permName, resolved.ReadOnly, planModeUntrustedReadOnly(execTool), safety, permArgs); decision.Blocked {
+		if decision := a.planModeDecision(permName, resolved.ReadOnly, safety, permArgs); decision.Blocked {
 			return toolOutcome{
 				output:  decision.Message,
 				blocked: true,
@@ -2900,11 +3318,16 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			}
 		}
 	}
-	if a.planMode.Load() && isMCPExecutionTarget(execTool, permName) && (!readOnly || planModeUntrustedReadOnly(execTool) || mcpDestructiveHint(execTool)) {
+	plannerTrustedMCP := a.plannerMCPExecution && isMCPExecutionTarget(execTool, permName) && mcpServerAuthorized(execTool) && !mcpDestructiveHint(execTool)
+	if a.planMode.Load() && isMCPExecutionTarget(execTool, permName) && !plannerTrustedMCP && (!readOnly || !mcpServerAuthorized(execTool) || mcpDestructiveHint(execTool)) {
+		reason := "writer/destructive target"
+		if readOnly && !mcpServerAuthorized(execTool) {
+			reason = "reader from an unauthorized server"
+		}
 		return toolOutcome{
-			output:  fmt.Sprintf("blocked: MCP writer/destructive target %q is unavailable during Plan mode; finish or exit Plan mode before requesting this call", permName),
+			output:  fmt.Sprintf("blocked: MCP %s %q is unavailable during Plan mode; finish or exit Plan mode before requesting this call", reason, permName),
 			blocked: true,
-			errMsg:  "blocked: MCP writer is unavailable during planning",
+			errMsg:  "blocked: MCP target is unavailable during planning",
 		}
 	}
 	if a.deliveryProfile && evidenceName == "bash" && evidence.BashToolCallMasksVerificationExit(evidenceArgs) {
@@ -2944,44 +3367,103 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			errMsg:  "blocked: active delivery todo required",
 		}
 	}
-	destructive := mcpDestructiveHint(execTool)
-	if isInstalledMCPTool(execTool) {
-		mode, reviewer := mcpApprovalPolicy(execTool)
-		var allow bool
-		var reason string
-		var err error
-		if mcpGate, ok := a.gate.(MCPApprovalGate); ok {
-			allow, reason, err = mcpGate.CheckMCP(ctx, permName, mcpApprovalSubject(execTool, permName), permArgs, readOnly, destructive, mode, reviewer)
-		} else if destructive {
-			freshGate, ok := a.gate.(FreshApprovalGate)
-			if !ok {
-				return toolOutcome{
-					output:  "blocked: this destructive MCP tool requires fresh human approval or a configured automatic approval reviewer before execution.",
-					blocked: true,
-					errMsg:  "blocked: destructive MCP approval required",
-				}
-			}
-			allow, reason, err = freshGate.CheckFresh(ctx, permName, mcpApprovalSubject(execTool, permName), permArgs, readOnly)
-		} else if a.gate != nil {
-			allow, reason, err = a.gate.Check(ctx, permName, permArgs, readOnly)
-		} else {
-			allow = true
+	// Auto Guard: after resolution/mutation classification, before
+	// permission approval and workspace write-lock acquisition, so a waiting
+	// recovery card never holds a write lease. Consult on mutations,
+	// verification, plan transitions, and again for every tool once an Episode
+	// is exhausted so host-proven read-only diagnosis can remain available while
+	// further execution is quarantined. Ask/Yolo still bypass inside the gate.
+	verification := evidenceName == "bash" && evidence.IsDeliveryVerificationCommand(bashCommandFromArgs(evidenceArgs))
+	planTransition, planBefore, planAfter := a.recoveryPlanTransition(evidenceName, evidenceArgs)
+	planReplacementAuthorized := false
+	recoveryGen := uint64(0)
+	episodeStopped := false
+	if ctrl := a.recoveryEpisodeControl(); ctrl != nil {
+		recoveryGen = ctrl.Generation()
+		episodeStopped = ctrl.EpisodeStopped(a.recoveryTaskID)
+	}
+	if a.recoveryGate != nil && (mutates || verification || planTransition || episodeStopped) {
+		subject := recoverySubject(evidenceName, evidenceArgs)
+		if planTransition {
+			subject = "Update the active execution plan"
 		}
-		if err != nil {
+		preview := strings.TrimSpace(call.Diff)
+		if preview == "" {
+			preview = subject
+		}
+		if planTransition {
+			preview = planAfter
+		}
+		episodeID := ""
+		if ctrl := a.recoveryEpisodeControl(); ctrl != nil {
+			episodeID = ctrl.EpisodeID()
+		}
+		dec, rerr := a.recoveryGate.BeforeMutation(ctx, RecoveryProposal{
+			AgentID:        a.recoveryAgentID,
+			TaskID:         a.recoveryTaskID,
+			TaskScopeID:    recoveryTaskScopeID(a.deliveryScopeID, a.recoveryRunSeq.Load()),
+			EpisodeID:      episodeID,
+			TaskSummary:    a.recoveryTaskSummary,
+			Tool:           evidenceName,
+			Args:           evidenceArgs,
+			Subject:        subject,
+			Preview:        preview,
+			ReadOnly:       readOnly,
+			Mutates:        mutates,
+			Verification:   verification,
+			PlanTransition: planTransition,
+			PlanBefore:     planBefore,
+			PlanAfter:      planAfter,
+		})
+		if dec.Generation != 0 {
+			recoveryGen = dec.Generation
+		}
+		if rerr != nil && !dec.Blocked {
 			return toolOutcome{
-				output:  fmt.Sprintf("blocked: %s (%v)", reason, err),
-				blocked: true,
-				errMsg:  fmt.Sprintf("blocked: %v", err),
+				output:             fmt.Sprintf("blocked: Auto Guard error: %v", rerr),
+				blocked:            true,
+				errMsg:             "blocked: Auto Guard error",
+				recoveryGeneration: recoveryGen,
 			}
 		}
-		if !allow {
-			if strings.TrimSpace(reason) == "" {
-				reason = "the MCP tool call was not approved"
+		if dec.Blocked || !dec.Allow {
+			msg := strings.TrimSpace(dec.Message)
+			if msg == "" {
+				msg = "blocked: Auto Guard declined this mutation"
+			}
+			if !strings.HasPrefix(msg, "blocked:") {
+				msg = "blocked: " + msg
 			}
 			return toolOutcome{
-				output:  "blocked: " + reason,
+				output:  msg,
 				blocked: true,
-				errMsg:  "blocked by MCP approval policy",
+				// Surface the concrete stopped operation and next step in the
+				// failed tool card instead of exposing only an internal guard name.
+				errMsg:             firstLine(msg),
+				recoveryGeneration: recoveryGen,
+				recoveryStopTurn:   dec.StopTurn,
+				recoveryStopReason: dec.StopReason,
+			}
+		}
+		planReplacementAuthorized = planTransition && dec.AuthorizePlanReplacement
+	}
+	// Trusted MCP fast path: installed tools and authorized lifecycle connects
+	// (mcp_connect__*) skip ordinary Ask/Auto/dontAsk gates. Only explicit deny
+	// and live authorization apply — first connect of an installed server must
+	// not re-prompt under headless or partial-auto policies.
+	if isInstalledMCPTool(execTool) || isMCPLifecycleConnectTarget(execTool) {
+		if !mcpServerAuthorized(execTool) {
+			return toolOutcome{
+				output:  "blocked: this project MCP server identity has not been authorized; approve the server from a parent session and retry",
+				blocked: true,
+				errMsg:  "blocked: MCP server identity is not authorized",
+			}
+		}
+		if denyGate, ok := a.gate.(ExplicitDenyGate); ok && denyGate.ExplicitlyDenies(permName, permArgs) {
+			return toolOutcome{
+				output:  "blocked: denied by permission policy — this tool/command is on the deny list. Do not retry it; choose another approach or stop and explain.",
+				blocked: true,
+				errMsg:  "blocked by permission policy",
 			}
 		}
 	} else if a.gate != nil {
@@ -3013,6 +3495,31 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				errMsg:  "blocked: workspace write lease unavailable",
 			}
 		}
+	}
+	// Resolve the concrete execution target before hooks. A proxy may carry a
+	// different target/name/argument set than the provider-visible call.
+	runTool := execTool
+	runArgs := execArgs
+	if resolved.Target != nil {
+		runTool = resolved.Target
+		runArgs = resolved.Args
+		if len(runArgs) == 0 {
+			runArgs = json.RawMessage(`{}`)
+		}
+	}
+	// Hold the parent claim before PreToolUse: hooks are user shell code and may
+	// mutate the same workspace. The reservation remains live through hooks,
+	// checkpointing, and the concrete Execute call, closing both hook-side and
+	// check-before-write TOCTOU windows. Dynamic Economy/MCP tools are covered
+	// here after registry lookup without schema-changing wrappers.
+	if releaseParentWrite, perr := a.reserveParentWrite(runTool, runArgs, readOnly); perr != nil {
+		return toolOutcome{
+			output:  "blocked: " + perr.Error(),
+			blocked: true,
+			errMsg:  "blocked: write path claimed by background subagent",
+		}
+	} else if releaseParentWrite != nil {
+		defer releaseParentWrite()
 	}
 	// PreToolUse hooks run after permission is granted but before the call: a
 	// gating hook (exit 2) refuses it, surfaced to the model like a gate denial.
@@ -3052,6 +3559,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	if !a.planMode.Load() {
 		cctx = evidence.WithTodoState(cctx, a.CanonicalTodoState())
 	}
+	if planReplacementAuthorized {
+		cctx = tool.WithPlanReplacementAuthorization(cctx)
+	}
 	if len(a.projectChecks) > 0 {
 		cctx = instruction.WithChecks(cctx, a.projectChecks)
 	}
@@ -3084,27 +3594,17 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	var result string
 	var images []string
 	var err error
-	// When a proxy resolved a concrete target, execute that target (not the
-	// proxy again) so permission-approved args and evidence stay aligned.
-	runTool := execTool
-	runArgs := execArgs
-	if resolved.Target != nil {
-		runTool = resolved.Target
-		runArgs = resolved.Args
-		if len(runArgs) == 0 {
-			runArgs = json.RawMessage(`{}`)
-		}
-	}
 	// A call that was authorized under reader classification carries that
 	// basis into dispatch: the MCP execution layer re-verifies it linearizably
-	// against live trust state and refuses to promote it into a writer lane if
-	// a concurrent revocation or reclassification landed after the gate.
-	if readOnly && isInstalledMCPTool(runTool) && !mcpDestructiveHint(runTool) {
-		fingerprint := ""
-		if fp, ok := runTool.(tool.MCPCapabilityFingerprint); ok {
-			fingerprint = fp.MCPCapabilityFingerprint()
-		}
-		cctx = tool.WithReaderExecutionIntent(cctx, fingerprint)
+	// against server authorization and live safety metadata, and refuses to
+	// promote it into a writer lane if reclassification landed after the gate.
+	if readOnly && isInstalledMCPTool(runTool) && mcpServerAuthorized(runTool) && !mcpDestructiveHint(runTool) {
+		cctx = tool.WithReaderExecutionIntent(cctx)
+	}
+	// Planner-trusted MCP: authorized + non-destructive, even without
+	// readOnlyHint. Final dispatch re-checks live authorization/destructiveHint.
+	if a.plannerMCPExecution && isMCPExecutionTarget(runTool, permName) && mcpServerAuthorized(runTool) && !mcpDestructiveHint(runTool) {
+		cctx = tool.WithNonDestructiveMCPExecutionIntent(cctx)
 	}
 	if it, ok := runTool.(tool.ImageTool); ok {
 		result, images, err = it.ExecuteWithImages(cctx, runArgs)
@@ -3149,6 +3649,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			a.hooks.PostToolUse(ctx, permName, permArgs, result)
 		}
 	}
+	if a.recoveryGate != nil {
+		a.observeRecoveryResult(ctx, evidenceName, evidenceArgs, readOnly, mutates, result, err, false, false, recoveryGen)
+	}
 	if err != nil {
 		detail := result
 		// Malformed-args failures are a transient model JSON glitch (e.g. options
@@ -3159,7 +3662,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			detail = strings.TrimRight(detail, "\n") + "\nThe arguments were not valid JSON. Re-emit them exactly per this schema:\n" + string(t.Schema())
 		}
 		body, truncMsg := truncateToolOutput(fmt.Sprintf("error: %v\n%s", err, detail))
-		return toolOutcome{output: body, errMsg: firstLine(err.Error()), truncated: truncMsg != "", truncMsg: truncMsg}
+		return toolOutcome{output: body, errMsg: firstLine(err.Error()), truncated: truncMsg != "", truncMsg: truncMsg, recoveryGeneration: recoveryGen}
 	}
 	a.recordRepeatSuccess(call, t)
 	// A foreground `task` sub-agent just finished — its result is the final answer.
@@ -3169,7 +3672,69 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 		a.hooks.SubagentStop(ctx, result)
 	}
 	body, truncMsg := truncateToolOutput(result)
-	return toolOutcome{output: body, images: images, truncated: truncMsg != "", truncMsg: truncMsg}
+	return toolOutcome{output: body, images: images, truncated: truncMsg != "", truncMsg: truncMsg, recoveryGeneration: recoveryGen}
+}
+
+// recoveryPlanTransition detects structural rewrites of an active canonical
+// task list. Initial plans and progress-only status updates stay on the fast
+// path; changing step identity, order, or hierarchy while work remains is a
+// semantic transition for the independent Auto reviewer.
+func (a *Agent) recoveryPlanTransition(toolName string, args json.RawMessage) (bool, string, string) {
+	if a == nil || toolName != "todo_write" || a.planMode.Load() {
+		return false, "", ""
+	}
+	before := a.CanonicalTodoState()
+	if len(before) == 0 || len(evidence.IncompleteTodos(before)) == 0 {
+		return false, "", ""
+	}
+	after := evidence.ReceiptFromToolCall("todo_write", args, true, true).Todos
+	if len(after) == 0 || evidence.ValidateSerialTodos(after) != nil || !evidence.PreservesCompletedTodoPositions(before, after) {
+		// Let todo_write report malformed or invalid state directly; an invalid
+		// task list is not a meaningful plan proposal for the reviewer.
+		return false, "", ""
+	}
+	if samePlanStructure(before, after) {
+		return false, "", ""
+	}
+	return true, planReviewText(before), planReviewText(after)
+}
+
+func samePlanStructure(a, b []evidence.TodoItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Level != b[i].Level || normalizePlanStep(a[i].Content) != normalizePlanStep(b[i].Content) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizePlanStep(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+}
+
+func planReviewText(todos []evidence.TodoItem) string {
+	var b strings.Builder
+	for i, todo := range todos {
+		indent := ""
+		if todo.Level == 1 {
+			indent = "  "
+		}
+		fmt.Fprintf(&b, "%s%d. %s [%s]", indent, i+1, normalizePlanStep(todo.Content), canonicalTodoStatus(todo.Status))
+		if i+1 < len(todos) {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func recoveryTaskScopeID(deliveryScopeID string, runSeq uint64) string {
+	if scope := strings.TrimSpace(deliveryScopeID); scope != "" {
+		return "goal:" + scope
+	}
+	return fmt.Sprintf("turn:%d", runSeq)
 }
 
 func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.ResolvedCall) (toolOutcome, bool) {
@@ -3183,27 +3748,46 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 			errMsg:  "blocked by read-only execution boundary",
 		}, true
 	}
+	// Destructive MCP is left for the Executor; Planner must not misread this
+	// as missing configuration or an unavailable MCP server.
+	blockDestructiveForExecutor := func(name string) (toolOutcome, bool) {
+		msg := "blocked: MCP capability " + name + " is destructive and is reserved for the Executor. Write the required operation into the plan/handoff so the Coordinator can hand it to the Executor; do not treat this as missing MCP configuration or an unavailable capability."
+		return toolOutcome{
+			output:  msg,
+			blocked: true,
+			errMsg:  "blocked: destructive MCP reserved for executor",
+		}, true
+	}
 	if resolved == nil {
+		if a.plannerMCPExecution && isMCPExecutionTarget(visible, "") {
+			if !mcpServerAuthorized(visible) {
+				return block("execute an MCP capability from an unauthorized server")
+			}
+			if readOnlyExecutionMCPDestructive(visible) {
+				return blockDestructiveForExecutor(visible.Name())
+			}
+			return toolOutcome{}, false
+		}
 		if visible == nil || !visible.ReadOnly() {
 			if reasoner, ok := visible.(tool.ReadOnlyExecutionBlockReason); ok && strings.TrimSpace(reasoner.ReadOnlyExecutionBlockReason()) != "" {
 				return block(reasoner.ReadOnlyExecutionBlockReason())
 			}
 			return block("execute a state-changing tool")
 		}
-		if u, ok := visible.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
-			return block("trust an externally asserted read-only target")
+		if isInstalledMCPTool(visible) && !mcpServerAuthorized(visible) {
+			return block("execute a reader from an unauthorized MCP server")
 		}
 		if readOnlyExecutionMCPDestructive(visible) {
 			return block("execute a destructive MCP capability")
 		}
-		if h, ok := visible.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsTrustedMCPStartup(visible) {
+		if h, ok := visible.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsMCPStartup(visible) {
 			return block("start or mutate a host capability")
 		}
 		return toolOutcome{}, false
 	}
 
 	switch resolved.ProxyAction {
-	case "inspect":
+	case "list", "inspect":
 		if !resolved.SkipExecute || resolved.Target != nil || !resolved.ReadOnly {
 			return block("execute a malformed dynamic inspection")
 		}
@@ -3212,7 +3796,29 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 		return block("decline a capability decision")
 	case "call":
 		if resolved.Target == nil {
+			if a.plannerMCPExecution && resolved.HostCompleted && resolved.SkipExecute && resolved.ReadOnly && !resolved.Unavailable {
+				if _, ok := parseMCPServerCapabilityID(resolved.CapabilityID); ok {
+					return toolOutcome{}, false
+				}
+			}
 			return block("execute an unresolved dynamic capability")
+		}
+		if a.plannerMCPExecution && plannerAllowsMCPTarget(resolved.Target, resolved.TargetName) {
+			if isMCPLifecycleConnectTarget(resolved.Target) {
+				if !plannerMCPConnectAllowed(resolved.Target) {
+					return block("start an unauthorized MCP server")
+				}
+			} else if !mcpServerAuthorized(resolved.Target) {
+				return block("execute an MCP capability from an unauthorized server")
+			}
+			if readOnlyExecutionMCPDestructive(resolved.Target) {
+				name := resolved.TargetName
+				if name == "" {
+					name = resolved.CapabilityID
+				}
+				return blockDestructiveForExecutor(name)
+			}
+			return toolOutcome{}, false
 		}
 		if !resolved.ReadOnly {
 			if reasoner, ok := resolved.Target.(tool.ReadOnlyExecutionBlockReason); ok && strings.TrimSpace(reasoner.ReadOnlyExecutionBlockReason()) != "" {
@@ -3220,13 +3826,13 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 			}
 			return block("execute a state-changing dynamic capability")
 		}
-		if u, ok := resolved.Target.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
-			return block("trust an externally asserted read-only dynamic capability")
+		if isInstalledMCPTool(resolved.Target) && !mcpServerAuthorized(resolved.Target) {
+			return block("execute a dynamic reader from an unauthorized MCP server")
 		}
 		if readOnlyExecutionMCPDestructive(resolved.Target) {
 			return block("execute a destructive MCP capability")
 		}
-		if h, ok := resolved.Target.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsTrustedMCPStartup(resolved.Target) {
+		if h, ok := resolved.Target.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsMCPStartup(resolved.Target) {
 			return block("start or mutate a host capability")
 		}
 		return toolOutcome{}, false
@@ -3239,25 +3845,58 @@ func readOnlyExecutionMCPDestructive(t tool.Tool) bool {
 	return mcpDestructiveHint(t)
 }
 
-func readOnlyExecutionAllowsTrustedMCPStartup(t tool.Tool) bool {
+func readOnlyExecutionAllowsMCPStartup(t tool.Tool) bool {
 	if t == nil || !t.ReadOnly() || readOnlyExecutionMCPDestructive(t) {
 		return false
 	}
-	if untrusted, ok := t.(tool.PlanModeUntrustedReadOnly); ok && untrusted.PlanModeUntrustedReadOnly() {
+	if !mcpServerAuthorized(t) {
 		return false
 	}
 	meta, ok := t.(tool.MCPMetadata)
 	if !ok || strings.TrimSpace(meta.MCPServerName()) == "" || strings.TrimSpace(meta.MCPRawToolName()) == "" {
 		return false
 	}
-	// A reader classification only admits a host start when it is backed by a
-	// real trust store: the hint/legacy compatibility paths used by direct
-	// library embedders never satisfy the strict boundary.
-	if authority, ok := t.(tool.ReadOnlyExecutionTrustAuthority); !ok || !authority.ReadOnlyExecutionTrustAuthority() {
+	return true
+}
+
+// plannerAllowsMCPTarget reports whether a resolved use_capability target is an
+// MCP tool or lifecycle connect that Planner may consider under
+// PlannerMCPExecution (authorization and destructive checks run separately).
+func plannerAllowsMCPTarget(t tool.Tool, targetName string) bool {
+	if t == nil {
 		return false
 	}
-	_, governed := t.(tool.MCPApprovalPolicy)
-	return governed
+	if isInstalledMCPTool(t) || isMCPLifecycleConnectTarget(t) {
+		return true
+	}
+	return isMCPExecutionTarget(t, targetName)
+}
+
+// isMCPLifecycleConnectTarget identifies on-demand MCP connect-and-list targets
+// (mcp_connect__<server>) used by use_capability action=call on mcp-server ids.
+func isMCPLifecycleConnectTarget(t tool.Tool) bool {
+	if t == nil {
+		return false
+	}
+	if _, ok := t.(mcpLifecycleConnect); ok {
+		return true
+	}
+	name := strings.TrimSpace(t.Name())
+	return strings.HasPrefix(name, "mcp_connect__")
+}
+
+// mcpLifecycleConnect is implemented by deferred connect targets so Planner
+// can authorize lifecycle actions without relying on name prefixes alone.
+type mcpLifecycleConnect interface {
+	MCPLifecycleConnect() bool
+	MCPServerAuthorized() bool
+}
+
+func plannerMCPConnectAllowed(t tool.Tool) bool {
+	if life, ok := t.(mcpLifecycleConnect); ok {
+		return life.MCPServerAuthorized()
+	}
+	return mcpServerAuthorized(t)
 }
 
 func isInstalledMCPTool(t tool.Tool) bool {
@@ -3269,9 +3908,9 @@ func isMCPExecutionTarget(t tool.Tool, name string) bool {
 	return isInstalledMCPTool(t) || strings.HasPrefix(strings.TrimSpace(name), "mcp__")
 }
 
-func planModeUntrustedReadOnly(t tool.Tool) bool {
-	untrusted, ok := t.(tool.PlanModeUntrustedReadOnly)
-	return ok && untrusted.PlanModeUntrustedReadOnly()
+func mcpServerAuthorized(t tool.Tool) bool {
+	authority, ok := t.(tool.MCPServerAuthorization)
+	return ok && authority.MCPServerAuthorized()
 }
 
 func mcpDestructiveHint(t tool.Tool) bool {
@@ -3279,32 +3918,12 @@ func mcpDestructiveHint(t tool.Tool) bool {
 	return ok && annotations.MCPDestructiveHint()
 }
 
-func mcpApprovalPolicy(t tool.Tool) (mode, reviewer string) {
-	policy, ok := t.(tool.MCPApprovalPolicy)
-	if !ok {
-		return tool.MCPApprovalAuto, ""
-	}
-	return tool.NormalizeMCPApprovalMode(policy.MCPApprovalMode()), tool.NormalizeMCPApprovalReviewer(policy.MCPApprovalReviewer())
-}
-
-func mcpApprovalSubject(t tool.Tool, fallback string) string {
-	if meta, ok := t.(tool.MCPMetadata); ok {
-		server := strings.TrimSpace(meta.MCPServerName())
-		raw := strings.TrimSpace(meta.MCPRawToolName())
-		if server != "" && raw != "" {
-			return server + "/" + raw
-		}
-	}
-	return strings.TrimSpace(fallback)
-}
-
-func (a *Agent) planModeDecision(toolName string, readOnly, untrustedReadOnly bool, safety planmode.PlanSafety, args json.RawMessage) planmode.Decision {
+func (a *Agent) planModeDecision(toolName string, readOnly bool, safety planmode.PlanSafety, args json.RawMessage) planmode.Decision {
 	return (planmode.Policy{}).Decide(planmode.Call{
-		Name:              toolName,
-		ReadOnly:          readOnly,
-		UntrustedReadOnly: untrustedReadOnly,
-		Safety:            safety,
-		Args:              args,
+		Name:     toolName,
+		ReadOnly: readOnly,
+		Safety:   safety,
+		Args:     args,
 	})
 }
 
@@ -3555,8 +4174,8 @@ func isBackgroundTaskCall(args string) bool {
 // toolReadOnly reports a tool's ReadOnly classification by name (false for an
 // unknown tool), for stamping early ToolDispatch events.
 func (a *Agent) toolReadOnly(name string) bool {
-	t, ok := a.tools.Get(name)
-	return ok && t.ReadOnly()
+	t, _, ambiguous := a.tools.ResolveCall(name)
+	return t != nil && len(ambiguous) == 0 && t.ReadOnly()
 }
 
 // firstLine returns s up to its first newline — a one-line failure summary for

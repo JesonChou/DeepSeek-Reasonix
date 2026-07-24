@@ -78,7 +78,7 @@ function baseSettings(displayMode: "standard" | "compact" = "standard"): Setting
     permissions: { mode: "ask", allow: [], ask: [], deny: [] },
     sandbox: { bash: "enforce", network: false, workspaceRoot: "", allowWrite: [], effectiveWorkspaceRoot: "/work", effectiveWriteRoots: ["/work"], shell: "auto" },
     network: { proxyMode: "auto", proxyUrl: "", noProxy: "", proxy: { type: "socks5", server: "", port: 0, username: "", password: "" } },
-    agent: { temperature: 0, maxSteps: 0, plannerMaxSteps: 0, maxSubagentDepth: 2, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" },
+    agent: { temperature: 0, maxSteps: 0, plannerMaxSteps: 0, maxSubagentDepth: 2, maxSubagentConcurrency: 6, maxParallelWriters: 3, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" },
     bot: {
       enabled: false,
       model: "",
@@ -241,6 +241,8 @@ const compactButton = Array.from(document.querySelectorAll("button")).find((butt
 if (!compactButton) throw new Error("compact display mode button did not render");
 eq(document.querySelectorAll(".step-limit-control").length, 0, "general settings hide executor and planner step-limit controls");
 ok(!document.body.textContent?.includes("step limit"), "general settings keep automatic progress free of step-limit copy");
+ok(!document.body.textContent?.includes("Automatic plan mode"), "general settings omit the retired automatic Plan Mode control");
+ok(!document.body.textContent?.includes("planning defaults"), "general settings omit retired automatic Plan Mode copy");
 
 await act(async () => {
   compactButton.click();

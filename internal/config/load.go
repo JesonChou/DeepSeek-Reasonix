@@ -73,6 +73,7 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	}
 	userDefaultModel := cfg.DefaultModel
 	globalSecrets := cfg.Secrets
+	globalRemote := cfg.Remote.Clone()
 
 	tomlSources = append(tomlSources, projectTOML)
 	if err := mergeTOML(cfg, projectTOML); err != nil {
@@ -82,6 +83,10 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	// reasonix.toml must not be able to flip on the workflow-breaking env/path
 	// protections.
 	cfg.Secrets = globalSecrets
+	// Remote SSH hosts are equally user-global: a cloned repo's reasonix.toml
+	// must not be able to inject hosts, jump chains, or port forwards that
+	// steer where Reasonix opens connections.
+	cfg.Remote = globalRemote
 	// TOML decoding replaces [[plugins]] wholesale, so cfg.Plugins now holds
 	// only the last file's. Re-merge by name across all sources (later wins) so a
 	// project reasonix.toml doesn't drop the global config's MCP servers.
@@ -106,7 +111,8 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 
 	// Claude Code's .mcp.json (project root) is read last and merged into
 	// [[plugins]], so a server configured for Claude works here unchanged.
-	// reasonix.toml wins on a name collision (see mergeMCPJSON).
+	// Project reasonix.toml wins on a name collision; project .mcp.json wins
+	// over a same-name user-global entry (see mergeMCPJSON).
 	mcpFile := mcpJSONFile
 	if root != "." {
 		mcpFile = filepath.Join(root, mcpJSONFile)
@@ -114,9 +120,6 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	entries, err := loadMCPJSON(mcpFile)
 	if err != nil {
 		return nil, err
-	}
-	for i := range entries {
-		entries[i] = restrictProjectMCPApprovalPolicy(entries[i])
 	}
 	cfg.mergeMCPJSON(entries)
 
@@ -131,8 +134,10 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	normalizePluginCommandLines(cfg)
 	normalizeLegacyEffort(cfg)
 	cfg.ignoredLegacyStepLimits = normalizeLegacyAgentStepLimits(cfg)
+	normalizeRetiredAutoPlan(cfg)
 	normalizeLegacyMCPTiers(cfg)
 	normalizeLegacyStepFunBaseURLs(cfg)
+	normalizeLegacyLongCatContextWindows(cfg)
 	normalizeLegacyMimoCustomProviders(cfg)
 	normalizeLegacyProviderModels(cfg)
 	normalizeDesktopOfficialProviderAccess(cfg)
@@ -144,7 +149,6 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	if userDefaultModelExplicit {
 		restoreUnresolvableProjectDefaultModel(cfg, userDefaultModel)
 	}
-	cfg.Agent.AutoPlan = userAutoPlanMode()
 	cfg.CredentialsStore = credentialsStoreMode()
 	cfg.setExpansionEnv(expansionEnv)
 	resolveProviderCredentialsForRoot(root, cfg)
@@ -215,19 +219,6 @@ func cloneStringMap(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
-}
-
-func userAutoPlanMode() string {
-	cfg := Default()
-	if uc := userConfigLoadPath(); uc != "" {
-		_ = mergeFile(cfg, uc)
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.Agent.AutoPlan)) {
-	case "on", "ask":
-		return "on"
-	default:
-		return "off"
-	}
 }
 
 // restoreUnresolvableProjectDefaultModel falls back to the user/global
@@ -375,7 +366,6 @@ func normalizeLegacyEffort(c *Config) {
 func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 	var merged []PluginEntry
 	index := map[string]int{}
-	userApprovalPolicies := map[string]PluginEntry{}
 	for _, path := range paths {
 		if _, err := os.Stat(path); err != nil {
 			continue
@@ -388,13 +378,8 @@ func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 			p, _ = NormalizePluginCommandLine(p)
 			if isUserConfigPath(path) {
 				p.Source = MCPSourceUserConfig
-				userApprovalPolicies[p.Name] = p
 			} else {
 				p.Source = MCPSourceProjectConfig
-				p = restrictProjectMCPApprovalPolicy(p)
-				if userPolicy, ok := userApprovalPolicies[p.Name]; ok {
-					p = inheritUserMCPApprovalPolicy(p, userPolicy)
-				}
 			}
 			if i, ok := index[p.Name]; ok {
 				merged[i] = p
@@ -405,47 +390,6 @@ func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 		}
 	}
 	return merged, nil
-}
-
-func inheritUserMCPApprovalPolicy(project, user PluginEntry) PluginEntry {
-	project.DefaultToolsApprovalMode = user.DefaultToolsApprovalMode
-	project.Tools = cloneMCPToolPolicies(user.Tools)
-	project.ApprovalsReviewer = user.ApprovalsReviewer
-	return project
-}
-
-// restrictProjectMCPApprovalPolicy keeps repository-controlled configuration
-// monotonic with the user's global permission posture. Project files may make
-// MCP calls stricter, but cannot silently auto-approve writers or route a human
-// prompt to an automated reviewer.
-func restrictProjectMCPApprovalPolicy(p PluginEntry) PluginEntry {
-	if strings.EqualFold(strings.TrimSpace(p.DefaultToolsApprovalMode), "approve") {
-		p.DefaultToolsApprovalMode = "auto"
-	}
-	if len(p.Tools) > 0 {
-		p.Tools = cloneMCPToolPolicies(p.Tools)
-		for name, policy := range p.Tools {
-			if strings.EqualFold(strings.TrimSpace(policy.ApprovalMode), "approve") {
-				policy.ApprovalMode = "auto"
-				p.Tools[name] = policy
-			}
-		}
-	}
-	if strings.EqualFold(strings.TrimSpace(p.ApprovalsReviewer), "auto_review") {
-		p.ApprovalsReviewer = "user"
-	}
-	return p
-}
-
-func cloneMCPToolPolicies(in map[string]MCPToolPolicy) map[string]MCPToolPolicy {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]MCPToolPolicy, len(in))
-	for name, policy := range in {
-		out[name] = policy
-	}
-	return out
 }
 
 // mergeTOMLProviders merges [[providers]] across TOML sources by provider name.
@@ -668,14 +612,30 @@ func normalizeConfigForEdit(cfg *Config) bool {
 	normalizePluginCommandLines(cfg)
 	normalizeLegacyEffort(cfg)
 	normalizeLegacyAgentStepLimits(cfg)
+	changed := normalizeRetiredAutoPlan(cfg)
 	normalizeLegacyMCPTiers(cfg)
-	changed := normalizeLegacyStepFunBaseURLs(cfg)
+	changed = normalizeLegacyStepFunBaseURLs(cfg) || changed
+	changed = normalizeLegacyLongCatContextWindows(cfg) || changed
 	changed = normalizeLegacyMimoCustomProviders(cfg) || changed
 	normalizeLegacyProviderModels(cfg)
 	normalizeDesktopOfficialProviderAccess(cfg)
 	applyDeepSeekOfficialDefaultPricing(cfg)
 	backfillDeepSeekOfficialPrices(cfg)
 	normalizeEffortConfig(cfg)
+	return changed
+}
+
+// normalizeRetiredAutoPlan keeps pre-v5 configs readable while enforcing the
+// single explicit-plan experience. The deprecated fields remain in AgentConfig
+// only so old TOML and older desktop payloads decode safely.
+func normalizeRetiredAutoPlan(c *Config) bool {
+	if c == nil {
+		return false
+	}
+	changed := strings.TrimSpace(c.Agent.AutoPlan) != "" && !strings.EqualFold(strings.TrimSpace(c.Agent.AutoPlan), "off") ||
+		strings.TrimSpace(c.Agent.AutoPlanClassifier) != ""
+	c.Agent.AutoPlan = "off"
+	c.Agent.AutoPlanClassifier = ""
 	return changed
 }
 
@@ -1150,6 +1110,38 @@ func normalizedBaseURLForMigration(raw string) string {
 	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }
 
+func normalizeLegacyLongCatContextWindows(c *Config) bool {
+	if c == nil {
+		return false
+	}
+	changed := false
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if p.ContextWindow != legacyLongCat20ContextWindow {
+			continue
+		}
+		var kind, baseURL string
+		switch strings.TrimSpace(p.PresetID) {
+		case "longcat-openai":
+			kind, baseURL = "openai", longCatOpenAIBaseURL
+		case "longcat-anthropic":
+			kind, baseURL = "anthropic", longCatAnthropicBaseURL
+		default:
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(p.Kind), kind) ||
+			normalizedBaseURLForMigration(p.BaseURL) != baseURL ||
+			!stringSlicesEqual(p.Models, longCat20Models) ||
+			p.Model != "" ||
+			p.Default != longCat20Models[0] {
+			continue
+		}
+		p.ContextWindow = longCat20ContextWindow
+		changed = true
+	}
+	return changed
+}
+
 func normalizeLegacyMimoProviderCatalogs(c *Config) bool {
 	if c == nil {
 		return false
@@ -1339,7 +1331,6 @@ func legacyMimoConfigRefs(c *Config) []string {
 		c.DefaultModel,
 		c.Agent.PlannerModel,
 		c.Agent.SubagentModel,
-		c.Agent.AutoPlanClassifier,
 		c.Bot.Model,
 	}
 	for _, ref := range c.Agent.SubagentModels {
@@ -1481,7 +1472,6 @@ func NormalizeLegacyDesktopProviderAccess(c *Config) {
 	addRef(c.DefaultModel)
 	addRef(c.Agent.PlannerModel)
 	addRef(c.Agent.SubagentModel)
-	addRef(c.Agent.AutoPlanClassifier)
 	for _, ref := range c.Agent.SubagentModels {
 		addRef(ref)
 	}
@@ -1669,7 +1659,6 @@ func retargetDesktopOfficialRefs(c *Config, access map[string]bool) {
 	c.DefaultModel = retargetDesktopOfficialRef(c.DefaultModel, access)
 	c.Agent.PlannerModel = retargetDesktopOfficialRef(c.Agent.PlannerModel, access)
 	c.Agent.SubagentModel = retargetDesktopOfficialRef(c.Agent.SubagentModel, access)
-	c.Agent.AutoPlanClassifier = retargetDesktopOfficialRef(c.Agent.AutoPlanClassifier, access)
 	for skill, ref := range c.Agent.SubagentModels {
 		c.Agent.SubagentModels[skill] = retargetDesktopOfficialRef(ref, access)
 	}

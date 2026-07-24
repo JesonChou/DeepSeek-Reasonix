@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -175,8 +176,8 @@ func (s *Server) switchModel(ctx context.Context, ref string) error {
 
 	// Snapshot the current controller under a short read of s.mu only.
 	cur := s.ctl()
-	if cur.Running() {
-		return fmt.Errorf("cannot switch model while a turn is running")
+	if controllerHasActiveRuntimeWork(cur) {
+		return fmt.Errorf("cannot switch model while active work or background jobs are running")
 	}
 
 	// Off-lock: snapshot, carry history, and build the replacement. None of these
@@ -272,8 +273,8 @@ func (s *Server) build(ctx context.Context, ref string) (*control.Controller, er
 // rebuilds via switchModel (which serializes on bindMu).
 func (s *Server) switchEffort(ctx context.Context, level string) error {
 	cur := s.ctl()
-	if cur.Running() {
-		return fmt.Errorf("cannot change effort while a turn is running")
+	if controllerHasActiveRuntimeWork(cur) {
+		return fmt.Errorf("cannot change effort while active work or background jobs are running")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -312,6 +313,14 @@ func (s *Server) switchEffort(ctx context.Context, level string) error {
 		return err
 	}
 	return s.switchModel(ctx, entry.Name+"/"+entry.Model)
+}
+
+func controllerHasActiveRuntimeWork(ctrl control.SessionAPI) bool {
+	if ctrl == nil {
+		return false
+	}
+	status := ctrl.RuntimeStatus()
+	return status.Running || status.PendingPrompt || status.BackgroundJobs > 0
 }
 
 // applyEffortEdit writes effort onto entry within edit, mirroring CLI/desktop
@@ -414,19 +423,32 @@ func (s *Server) Run(addr string) error {
 // the provided context and drains active connections for up to 10 seconds
 // before returning.
 func (s *Server) RunGraceful(ctx context.Context, addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.RunGracefulListener(ctx, ln)
+}
+
+// RunGracefulListener is RunGraceful over a caller-supplied listener. Callers
+// that need the real bound address (e.g. --addr 127.0.0.1:0 with --port-file)
+// listen first, record ln.Addr(), then hand the listener here.
+func (s *Server) RunGracefulListener(ctx context.Context, ln net.Listener) error {
 	s.ctl().EnableInteractiveApproval()
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- srv.ListenAndServe()
+		errCh <- srv.Serve(ln)
 	}()
 	select {
 	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return err
 	case <-ctx.Done():
 		slog.Info("serve: shutting down gracefully")
@@ -435,7 +457,11 @@ func (s *Server) RunGraceful(ctx context.Context, addr string) error {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			slog.Warn("serve: graceful shutdown failed", "err", err)
 		}
-		return <-errCh
+		err := <-errCh
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
 	}
 }
 

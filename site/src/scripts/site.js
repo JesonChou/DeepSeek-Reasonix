@@ -1,7 +1,9 @@
 import { downloadPaneFromURL } from "./download-link.js";
+import { initTheme } from "./theme.js";
 
 // Reasonix site — vanilla interactions
 (function () {
+  initTheme();
   const motionOK = () =>
     document.body.dataset.motion === "rich" &&
     !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -113,13 +115,17 @@ import { downloadPaneFromURL } from "./download-link.js";
   /* language switch */
   const LANG_KEY = "reasonix-lang";
   const langBtns = Array.from(document.querySelectorAll(".lang-switch button"));
-  const setLang = (l) => {
+  const setLang = (l, alignHash) => {
     document.body.dataset.lang = l;
     document.documentElement.lang = l === "zh" ? "zh-CN" : "en";
     const t = document.body.dataset[l === "zh" ? "titleZh" : "titleEn"];
     if (t) document.title = t;
     langBtns.forEach((b) => b.classList.toggle("active", b.dataset.lang === l));
     try { localStorage.setItem(LANG_KEY, l); } catch (e) {}
+    if (alignHash && window.location.hash) {
+      const target = document.getElementById(window.location.hash.slice(1));
+      if (target) requestAnimationFrame(() => target.scrollIntoView({ block: "start" }));
+    }
   };
   langBtns.forEach((b) => b.addEventListener("click", () => setLang(b.dataset.lang)));
   let savedLang = "";
@@ -128,20 +134,46 @@ import { downloadPaneFromURL } from "./download-link.js";
   const initialLang = requestedLang === "zh" || requestedLang === "en"
     ? requestedLang
     : savedLang || ((navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en");
-  setLang(initialLang);
+  setLang(initialLang, true);
 
   /* docs scrollspy */
   const sideLinks = Array.from(document.querySelectorAll(".docs-side a[href^='#']"));
   if (sideLinks.length) {
     const targets = sideLinks
       .map((a) => document.getElementById(a.getAttribute("href").slice(1)))
-      .filter(Boolean);
+      .filter(Boolean)
+      // Sidebar links are grouped editorially, so their order differs from the
+      // page order. The spy below picks the last section past the 140px line,
+      // which is only correct when targets are sorted in document order.
+      .sort((a, b) =>
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+    const setActive = (id) =>
+      sideLinks.forEach((a) => {
+        const on = a.getAttribute("href") === "#" + id;
+        a.classList.toggle("active", on);
+        if (on) a.setAttribute("aria-current", "true");
+        else a.removeAttribute("aria-current");
+      });
+    // While a click smooth-scrolls to a section, pin the highlight to it so it
+    // doesn't sweep through every section scrolled past on the way. scrollend
+    // releases the pin when the scroll settles — on arrival or when the user
+    // takes over (wheel, touch, keyboard, scrollbar). Browsers without
+    // scrollend just skip pinning: correct destination, no sweep suppression.
+    let pinned = null;
     const spy = () => {
+      if (pinned) return;
       let current = targets[0];
       for (const t of targets) if (t.getBoundingClientRect().top < 140) current = t;
-      sideLinks.forEach((a) =>
-        a.classList.toggle("active", current && a.getAttribute("href") === "#" + current.id));
+      if (current) setActive(current.id);
     };
+    if ("onscrollend" in window) {
+      const ids = new Set(targets.map((t) => t.id));
+      document.querySelectorAll("a[href^='#']").forEach((a) => {
+        const id = a.getAttribute("href").slice(1);
+        if (ids.has(id)) a.addEventListener("click", () => { pinned = id; setActive(id); });
+      });
+      window.addEventListener("scrollend", () => { pinned = null; spy(); }, { passive: true });
+    }
     window.addEventListener("scroll", spy, { passive: true });
     spy();
   }

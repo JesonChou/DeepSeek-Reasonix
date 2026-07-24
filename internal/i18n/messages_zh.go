@@ -25,11 +25,13 @@ var Chinese = Messages{
 	StepRunDesc:    "执行单次任务",
 	HelpFooter:     "reasonix help · 查看全部命令",
 
-	ChatTip:           "对话上下文将跨轮保留。输入 'exit' 或按 Ctrl-D 退出。",
-	TurnCancelled:     "已取消 — 回到提示符",
-	NoSessionToResume: "没有可恢复的会话 — 用 `reasonix` 开一个新的",
-	ResumeRequiresTTY: "--resume 需要交互式终端；用 --continue 直接恢复最近一次",
-	PickSessionLabel:  "恢复哪个会话？",
+	ChatTip:             "对话上下文将跨轮保留。输入 'exit' 或按 Ctrl-D 退出。",
+	TurnCancelled:       "已取消 — 回到提示符",
+	InterruptedRecovery: "本轮已中断。部分输出会永久保留供查看；只有完整工具调用及结果和有界恢复摘要会进入模型下一轮。继续或回滚前请先检查当前工作区。",
+	RecoveryPaused:      "已暂停自动重试。Reasonix 已停止重复尝试，并保留已完成的工作。发送“继续”即可开始新一轮，也可以补充要求来调整方向。",
+	NoSessionToResume:   "没有可恢复的会话 — 用 `reasonix` 开一个新的",
+	ResumeRequiresTTY:   "--resume 需要交互式终端；用 --continue 直接恢复最近一次",
+	PickSessionLabel:    "恢复哪个会话？",
 
 	ResumeListHeader:    "会话（/resume <n> 切换）",
 	ResumeBusy:          "请先完成或取消当前这一轮再恢复会话",
@@ -64,8 +66,9 @@ var Chinese = Messages{
 	ChatStatusBalanceLabel:                 "余额",
 	ChatStatusCacheNowFmt:                  "本次命中 %s",
 	ChatStatusCacheAvgFmt:                  "平均 %s",
-	ChatStatusPlanApproval:                 "Enter/y 批准并执行 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动",
-	PlanApprovalPrompt:                     "计划已生成（见上方）— Enter/y 批准执行,n/Esc 继续规划",
+	ChatStatusPlanApproval:                 "1 开始执行 · 2 修改计划 · 3 暂不执行并退出 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动",
+	PlanApprovalPrompt:                     "计划已生成（见上方）— 请选择下一步操作",
+	PlanApprovalChoices:                    "1. 开始执行\n2. 修改计划（继续规划）\n3. 暂不执行，退出计划模式\n选择 [1/2/3]（y 开始执行；n/Esc 继续规划）",
 	ChatStatusToolApproval:                 "1 本次允许 · 2 本会话允许此范围 · 提供时 3/4 为前缀或保存 · n/Esc 拒绝 · Ctrl-C 取消本轮",
 	AskTypeSomething:                       "自己输入",
 	AskTypingHint:                          "输入后按 Enter 确认",
@@ -80,6 +83,12 @@ var Chinese = Messages{
 	BashPrefixChoices:                      "1. 本次允许\n2. 本会话允许 %s\n3. 总是允许 %s（保存到配置）\n4. 拒绝\n选择 [1/2/3/4]（兼容 y/a/p/n）",
 	PlanModeReadOnlyCommandChoices:         "1. 本次信任\n2. 本会话信任此前缀\n3. 总是在计划模式信任此前缀（保存到配置）\n4. 拒绝\n选择 [1/2/3/4]（兼容 y/a/p/n）",
 	FreshHumanApprovalChoices:              "1. 本次允许\n2. 拒绝\n选择 [1/2]（兼容 y/n）",
+	RecoveryApprovalChoices:                "1. 继续一次\n2. 换个方案",
+	RecoveryPlanChangeChoices:              "1. 采用新计划并继续\n2. 不采用，让 Auto 调整",
+	RecoveryPlanDecisionPrompt:             "执行计划需要你的决定",
+	RecoveryPlanBeforeFmt:                  "原计划：%s",
+	RecoveryPlanAfterFmt:                   "新计划：%s",
+	RecoveryTaskGrantChoices:               "1. 继续一次\n2. 继续，并在本任务内允许同类操作\n3. 换个方案",
 	SandboxEscapeApprovalChoices:           "1. 允许一次\n2. 本会话使用真实环境\n3. 拒绝\n选择 [1/2/3]（兼容 y/a/n）",
 	ApprovalNeededFmt:                      "需要审批：%s",
 	ApprovalNeededWithSubjectFmt:           "需要审批：%s %s",
@@ -100,11 +109,6 @@ var Chinese = Messages{
 	MemoryApprovalSaveUpdate:               "保存/更新记忆",
 	MemoryApprovalBodyLabel:                "正文",
 	MemoryApprovalArchiveFmt:               "归档记忆 %q",
-	MCPDestructiveSubjectFmt:               "MCP %s 声明包含破坏性副作用",
-	MCPDestructiveReason:                   "这个已安装的 MCP 工具声明包含破坏性副作用。允许前请核对目标和参数；自动/YOLO 审批不能代答这个决定。",
-	MCPDestructiveDeclined:                 "用户拒绝了这个破坏性 MCP 工具调用；不要重试，请询问用户希望如何继续。",
-	MCPReviewerUnavailableReason:           "配置的自动审批 reviewer 不可用或未给出结论。本次调用需要用户当场决定；自动/YOLO 审批与会话授权不能代答。",
-	MCPReviewerUnavailableDeclined:         "自动 reviewer 不可用后，用户拒绝了这个 MCP 工具调用；不要重试，请询问用户希望如何继续。",
 	PlanModeBashTrustSubjectFmt:            "在计划模式中信任 %q 为只读命令前缀\n命令：%s",
 	PlanModeBashTrustReason:                "这条 bash 命令不在 Reasonix 内置只读集合中。只有在确认这个精确前缀用于计划和研究时是只读的，才应批准。自动/YOLO 审批不能回答这个信任提示。",
 	PlanModeBashTrustDeclined:              "用户拒绝将这条 bash 命令信任为计划模式只读命令；不要重试它，请继续使用其它已信任的只读工具，或询问用户希望如何继续。",
@@ -210,6 +214,8 @@ var Chinese = Messages{
 	MouseCopiedHint:              "已复制到剪贴板",
 	ClipboardCopyOSC52Hint:       "已通过 OSC 52 请求复制 — 可能需要终端授权",
 	ClipboardCopyFallbackHint:    "系统剪贴板不可用 — 已回退到 OSC 52",
+	ClipboardTextPasteRemoteHint: "SSH 下鼠标粘贴无法读取本地剪贴板或 PRIMARY 选区 — 请使用终端粘贴快捷键或 /mouse",
+	ClipboardTextPasteFailedFmt:  "粘贴文本失败：%v",
 	ClipboardImagePastingHint:    "正在粘贴图片…",
 	ClipboardImagePasteFailedFmt: "粘贴图片失败：%v",
 	MouseCaptureOnHint:           "鼠标接管已开启 — 应用内拖拽选中/滚动条/滚轮生效",
@@ -240,6 +246,7 @@ var Chinese = Messages{
 	CmdRemember:         "保存一条记忆",
 	CmdForget:           "归档一条已存记忆",
 	CmdMcp:              "MCP 服务器",
+	CmdRemote:           "远程 SSH 主机",
 	CmdHooks:            "管理 hooks",
 	CmdPlugins:          "管理插件包",
 	CmdPasteImage:       "粘贴剪贴板图片",
@@ -253,7 +260,6 @@ var Chinese = Messages{
 	CmdSandbox:          "查看沙箱状态",
 	CmdEffort:           "设置推理强度",
 	CmdMouse:            "切换鼠标接管（关闭后由终端原生处理选中/右键）",
-	CmdAutoPlan:         "配置自动计划模式",
 	CmdReasonLang:       "设置可见思考语言",
 	CmdHelp:             "查看命令列表",
 	CmdTodo:             "清除任务清单",
@@ -274,7 +280,6 @@ var Chinese = Messages{
 	ArgMcpList:          "显示已配置的服务器",
 	ArgMcpConnected:     "已连接",
 	ArgHooksList:        "列出生效的 hooks",
-	ArgHooksTrust:       "信任本项目的 hooks",
 	ArgModelCurrent:     "当前",
 	ArgEffortAuto:       "使用模型默认值",
 	ArgEffortLow:        "较轻推理",
@@ -296,7 +301,7 @@ var Chinese = Messages{
 	ListSkillsHeaderFmt: "skills（%d 个）",
 	ListSkillsNone:      "暂无 skill — 调用内置的（如 /init），或用 install_skill 创建一个",
 	ListHooksHeaderFmt:  "hooks（生效 %d 个）",
-	ListHooksNone:       "无生效 hooks — 在 .reasonix/settings.json（项目，需信任后）或 <Reasonix home>/settings.json（全局）配置",
+	ListHooksNone:       "无生效 hooks — 在 .reasonix/settings.json（项目）或 <Reasonix home>/settings.json（全局）配置",
 	ListMcpHeader:       "MCP 服务器",
 	ListMcpNone:         "未连接 MCP 服务器 — 在 reasonix.toml（[[plugins]]）或项目 .mcp.json 中添加",
 
@@ -314,7 +319,7 @@ var Chinese = Messages{
 	GoalSetFmt:                "目标已设置 → %s",
 	GoalCleared:               "目标已清除",
 	ModelSwitchUnavailable:    "本会话不支持切换模型",
-	ModelSwitchBusy:           "请先完成或取消当前这一轮再切换模型",
+	ModelSwitchBusy:           "请先完成或取消当前工作，并停止后台任务后再切换模型",
 	ModelAlreadyOnFmt:         "已经在使用 %s",
 	ModelSwitchingFmt:         "正在切换到 %s…",
 	ModelSwitchedFmt:          "已切换到 %s（会保留当前对话，但提示词缓存会重新计算）",
@@ -437,6 +442,18 @@ var Chinese = Messages{
 	AnthropicFetchModelsFailedFmt:  "获取 %s 模型失败: %v",
 	AnthropicSelectModelsLabel:     "选择要启用的 %s 模型",
 
+	RemoteConnectingFmt:       "正在连接 %s…",
+	RemoteConnectedFmt:        "已连接到 %s",
+	RemoteReconnectingFmt:     "正在重连 %s(第 %d 次)…",
+	RemoteDegradedFmt:         "已连接到 %s,但部分端口转发未建立",
+	RemoteDisconnected:        "已断开(远端 serve 仍在运行)",
+	RemoteServeReadyFmt:       "远端 serve 就绪:%s",
+	RemoteHostKeyPromptFmt:    "未知的主机密钥 %s\n  类型:  %s\n  指纹:  %s",
+	RemotePassphrasePromptFmt: "%s 的密钥口令:",
+	RemotePasswordPromptFmt:   "%s 的登录密码:",
+	RemoteBootstrapStepFmt:    "远端 serve:%s %s",
+	RemoteNoHostsHint:         "尚未配置远程主机;用 `reasonix remote add <名称> [user@]host` 添加",
+
 	UnknownCommandFmt:         "未知命令 %q",
 	UsageRunHint:              "用法：reasonix -p [--model NAME] <task>",
 	ErrorPrefix:               "错误：",
@@ -449,6 +466,8 @@ var Chinese = Messages{
 	ProviderErrAuthRejected:        "认证失败 (HTTP 401)：服务端拒绝了你的 API key。可能是 key 错误或已过期，也可能是服务端出现瞬时鉴权/额度问题——已退避重试仍失败。请稍后再试，或检查 .env 中的密钥 / 运行 `reasonix setup`。",
 	ProviderErrInsufficientBalance: "余额不足 (HTTP 402)：账户余额不足，请前往充值后重试。",
 	ProviderErrUnprocessable:       "参数错误 (HTTP 422)：某个请求参数被拒绝，通常是程序缺陷。若持续出现请反馈。",
+	ProviderErrInputSensitive:      "输入被 MiniMax 内容审查拒绝（错误码 1026）。审查对象可能包含会话历史和工具结果；请调整相关内容，或新建会话仅保留必要上下文。原样重试通常无效。",
+	ProviderErrOutputSensitive:     "MiniMax 生成的内容被内容审查拒绝（错误码 1027）。请调整请求内容后重试；若持续出现，可改用其他服务商。",
 	ProviderErrRateLimited:         "请求速率达到上限 (HTTP 429)：请求过于频繁 (TPM/RPM)。已退避重试，请放慢速率或稍后再试。",
 	ProviderErrServer:              "服务器故障 (HTTP 500)：服务端内部错误。已退避重试；若持续失败请稍后再试。",
 	ProviderErrServerBusy:          "服务器繁忙 (HTTP 503)：服务端负载过高。已退避重试，请稍后再试。",
@@ -493,17 +512,22 @@ var Chinese = Messages{
   reasonix [--model NAME] [-c|--continue] [-r|--resume [QUERY]] [--permission-mode MODE] [--effort LEVEL] [--add-dir PATH]   交互式会话
   reasonix -p|--print [--model NAME] [--output-format text|json|stream-json] [--allowed-tools RULES] [--add-dir PATH] <task>
   reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
+  reasonix run --events-jsonl [--model NAME] <task>      输出脱敏结构化事件 JSONL
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI 代码审查（基于本地 diff）
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  通过 HTTP+SSE 提供服务（支持可选认证）
   reasonix acp [--model NAME]                           通过 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
   reasonix setup [path]                                 交互式配置向导；生成 reasonix.toml（及 .env）
-  reasonix config auto-plan [off|on]                    配置自动计划模式
   reasonix config reasoning-language [auto|zh|en]        配置可见思考语言
   reasonix mcp <add|remove|list|import>                 管理 reasonix.toml 里的 MCP 服务器
   reasonix subagent <list|create|edit|delete|try|run>   管理和运行隔离子智能体 profile
   reasonix init                                         查看如何生成项目记忆（AGENTS.md）
   reasonix doctor [--json]                              输出脱敏的本地诊断信息
   reasonix doctor session <branch-id> [--zip] [--out PATH]  导出会话冲突诊断 zip
+  reasonix session list --json [--dir PATH]             为机器客户端列出脱敏会话
+  reasonix session show|status <machine-session-id> --json [--dir PATH]  查询单个脱敏会话
+  reasonix session recovery [<machine-session-id>] --json [--dir PATH]  查询脱敏恢复状态
+  reasonix hook list|status --json [--dir PATH]         查看脱敏 Hook 状态
+  reasonix task list|show --json [--dir PATH]           查看脱敏 Task 状态
   reasonix bot start|doctor|weixin-login                多渠道 IM bot 网关
   reasonix upgrade [--check] [--force]                   自更新到最新版本（也可用：reasonix update）
   reasonix version

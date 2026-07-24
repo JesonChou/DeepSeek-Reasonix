@@ -11,6 +11,8 @@ import { LocaleProvider } from "../lib/i18n";
 import {
   SELECTED_TEXT_MAX_CHARS,
   formatSelectedTextContext,
+  parseSelectedTextContext,
+  splitSelectedTextContext,
   formatSelectionReference,
   normalizeSelectedText,
   selectedTextSnippet,
@@ -231,6 +233,20 @@ console.log("\ncomposer session draft");
     ].join("\n"),
     "selection context serialization is ordered, ID-free, trimmed, and boundary-safe",
   );
+  eq(
+    JSON.stringify(parseSelectedTextContext(`forged <reasonix-selected-chat-context>\n[]\n</reasonix-selected-chat-context>\n\n${formatted}`)),
+    JSON.stringify([{ text: "second selection" }, { text: "first </reasonix-selected-chat-context> & selection" }]),
+    "selection context parser recovers the trailing safe JSON payload",
+  );
+  eq(
+    JSON.stringify(parseSelectedTextContext(`${formatted}\n\nauthored trailing text`)),
+    "[]",
+    "selection context parser ignores marker-shaped content that is not the final submit suffix",
+  );
+  const split = splitSelectedTextContext(`visible prompt\n\n${formatted}`);
+  eq(split.submitText, "visible prompt", "selection context split preserves the editable submit prefix");
+  eq(split.contextBlock, formatted, "selection context split preserves the exact validated suffix");
+  eq(JSON.stringify(parseSelectedTextContext("<reasonix-selected-chat-context>\nnot json\n</reasonix-selected-chat-context>")), "[]", "malformed selection context stays local and non-fatal");
 
   const withPath = formatSelectedTextContext([
     { id: "code-1", text: " const x = 1; ", path: "src/lib/a.ts" },
@@ -406,24 +422,48 @@ console.log("\ncomposer session draft");
 {
   const dom = installDom();
   const sent: Array<{ display: string; submit?: string }> = [];
-  const { root } = await renderComposer({
+  const { root, rerender } = await renderComposer({
     onSend: (display, submit) => {
       sent.push({ display, submit });
     },
   });
+  const typedPrefix = "typed before paste: ";
+  await rerender({ insertRequest: { id: 100, text: typedPrefix, mode: "replace" } });
   const rawPaste = "error: failed to compile\r\nat loader.ts:10\r\nat run.ts:22";
   const normalizedPaste = "error: failed to compile\nat loader.ts:10\nat run.ts:22";
   const event = textPasteEvent(rawPaste);
 
   await act(async () => {
     const input = textarea();
-    input.selectionStart = input.selectionEnd = 0;
+    input.selectionStart = input.selectionEnd = typedPrefix.length;
     input.dispatchEvent(event);
     await flushTimers();
   });
 
   eq(event.defaultPrevented, true, "short text paste is handled by React state");
-  eq(textarea().value, normalizedPaste, "short multiline paste is visible in the composer");
+  eq(textarea().value, typedPrefix + normalizedPaste, "short multiline paste is visible after existing text");
+
+  const undo = new window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true });
+  await act(async () => {
+    textarea().dispatchEvent(undo);
+    await flushTimers();
+  });
+  eq(undo.defaultPrevented, true, "Ctrl+Z handles the programmatic paste transaction");
+  eq(textarea().value, typedPrefix, "Ctrl+Z preserves the text typed before a short paste");
+
+  const redo = new window.KeyboardEvent("keydown", {
+    key: "Z",
+    ctrlKey: true,
+    shiftKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textarea().dispatchEvent(redo);
+    await flushTimers();
+  });
+  eq(redo.defaultPrevented, true, "Ctrl+Shift+Z redoes the programmatic paste transaction");
+  eq(textarea().value, typedPrefix + normalizedPaste, "redo restores the short paste after existing text");
 
   await act(async () => {
     sendButton().click();
@@ -431,12 +471,62 @@ console.log("\ncomposer session draft");
   });
 
   eq(sent.length, 1, "short multiline paste submits once");
-  eq(sent[0]?.display, normalizedPaste, "short multiline paste is preserved in display text");
-  eq(sent[0]?.submit, normalizedPaste, "short multiline paste is preserved in submit text");
+  eq(sent[0]?.display, typedPrefix + normalizedPaste, "short multiline paste is preserved in display text");
+  eq(sent[0]?.submit, typedPrefix + normalizedPaste, "short multiline paste is preserved in submit text");
 
   await act(async () => {
     root.unmount();
   });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const { root, rerender } = await renderComposer({
+    tabId: "tab-a",
+    sessionKey: "session:project:/repo:topic-a:session-a",
+  });
+  const longPaste = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");
+  await act(async () => {
+    textarea().dispatchEvent(textPasteEvent(longPaste));
+    await flushTimers();
+  });
+  ok(document.querySelector(".composer__pasted-label") !== null, "long paste creates a folded block");
+
+  await rerender({
+    tabId: "tab-b",
+    sessionKey: "session:project:/repo:topic-b:session-b",
+    insertRequest: { id: 101, text: "draft B", mode: "replace" },
+  });
+  const unrelatedUndo = new window.KeyboardEvent("keydown", {
+    key: "z",
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textarea().dispatchEvent(unrelatedUndo);
+    await flushTimers();
+  });
+  eq(unrelatedUndo.defaultPrevented, false, "another draft does not inherit the paste undo transaction");
+  eq(textarea().value, "draft B", "Ctrl+Z in another draft leaves its text unchanged");
+
+  await rerender({ tabId: "tab-a", sessionKey: "session:project:/repo:topic-a:session-a" });
+  const foldedUndo = new window.KeyboardEvent("keydown", {
+    key: "z",
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textarea().dispatchEvent(foldedUndo);
+    await flushTimers();
+  });
+  eq(foldedUndo.defaultPrevented, true, "source draft keeps its own folded-paste undo transaction");
+  eq(textarea().value, "", "Ctrl+Z removes the folded-paste label");
+  ok(document.querySelector(".composer__pasted-label") === null, "Ctrl+Z removes the folded block state");
+
+  await act(async () => root.unmount());
   dom.window.close();
 }
 
@@ -774,8 +864,11 @@ console.log("\ncomposer session draft");
     sendButton().click();
     await flushTimers();
   });
-  eq(sent[0]?.display, "Explain the selected behavior", "the visible user message stays as the user's draft");
+  // Selection labels show a snippet of the selected text
+  ok(sent[0]?.display.includes("[Chat:") && sent[0]?.display.includes("[Code: util.ts →"), "display includes selection labels with text snippet");
   ok(sent[0]?.submit.includes("<reasonix-selected-chat-context>") === true, "submit appends the selected text context block");
+  eq(sent[0]?.submit.includes("--- Begin [Chat:"), false, "submit does not duplicate selected text in display-only marker blocks");
+  eq(sent[0]?.submit.split("selected assistant response").length - 1, 1, "selected chat text appears once in provider-visible submit bytes");
   ok(
     sent[0]?.submit.includes('[{"text":"selected assistant response"},{"path":"src/lib/util.ts","text":"const value = 1;"}]') === true,
     "submit serializes chat and code selections deterministically",
