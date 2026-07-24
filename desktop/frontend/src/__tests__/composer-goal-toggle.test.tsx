@@ -1455,8 +1455,42 @@ console.log("\ncomposer goal toggle");
     document.activeElement === textareaAfterEntityRemoval,
     "removing the last entity hands focus to the textarea that replaces the rich input",
   );
+  const undoEntityRemoval = new window.KeyboardEvent("keydown", {
+    key: "z",
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textareaAfterEntityRemoval.dispatchEvent(undoEntityRemoval);
+    await flushTimers();
+  });
+  eq(undoEntityRemoval.defaultPrevented, true, "Ctrl+Z restores a token removed by the rich composer");
+  ok(
+    document.querySelector(".invocation-display--composer") !== null,
+    "undoing the programmatic Backspace restores the selected skill",
+  );
+  const restoredRichInput = document.querySelector(".composer__rich-input") as HTMLDivElement | null;
+  if (!restoredRichInput) throw new Error("rich composer did not return after undoing token removal");
+  const redoEntityRemoval = new window.KeyboardEvent("keydown", {
+    key: "Z",
+    ctrlKey: true,
+    shiftKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    restoredRichInput.dispatchEvent(redoEntityRemoval);
+    await flushTimers();
+  });
+  eq(redoEntityRemoval.defaultPrevented, true, "Ctrl+Shift+Z redoes rich token removal");
+  ok(
+    document.querySelector(".invocation-display--composer") === null,
+    "redoing the programmatic Backspace removes the selected skill again",
+  );
 
   await replaceComposerDraft(rerender, 2002, "/writing-plans");
+  await waitFor("plain composer after replacing the restored skill", () => Boolean(document.querySelector("textarea")));
   await waitFor("skill menu after removal", () => Boolean(document.querySelector(".slashmenu")));
   textarea = document.querySelector("textarea") as HTMLTextAreaElement | null;
   if (!textarea) throw new Error("composer textarea did not return after removing the skill");

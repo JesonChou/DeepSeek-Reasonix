@@ -42,6 +42,7 @@ import { ContextWindowRing } from "./ContextWindowRing";
 import { ImageViewer } from "./ImageViewer";
 import {
   RichComposerInput,
+  type RichComposerChangeOrigin,
   type RichComposerInputHandle,
   type RichComposerSelection,
   type RichSlashQuery,
@@ -141,11 +142,15 @@ type ComposerEditSnapshot = {
 type ComposerEditTransaction = {
   before: ComposerEditSnapshot;
   after: ComposerEditSnapshot;
+  nativeBarrierBefore: boolean;
+  nativeBarrierAfter: boolean;
 };
 
 type ComposerEditHistory = {
   undo: ComposerEditTransaction[];
   redo: ComposerEditTransaction[];
+  undoNativeBarrier: boolean;
+  redoNativeBarrier: boolean;
 };
 
 type WebkitFileEntry = {
@@ -715,6 +720,7 @@ export function Composer({
   const richInputRef = useRef<RichComposerInputHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editHistoryByDraftRef = useRef<Record<string, ComposerEditHistory>>({});
+  const pendingNativeInputTypeRef = useRef<string | undefined>(undefined);
   const composerCardRef = useRef<HTMLDivElement>(null);
   const contentMenuAnchorRef = useRef<HTMLButtonElement>(null);
   const intentMenuAnchorRef = useRef<HTMLButtonElement>(null);
@@ -872,20 +878,62 @@ export function Composer({
     left.text === right.text
     && left.nextPasteId === right.nextPasteId
     && JSON.stringify(left.invocations) === JSON.stringify(right.invocations)
-    && JSON.stringify(left.pastedBlocks) === JSON.stringify(right.pastedBlocks)
-    && JSON.stringify(left.openPastedLabels) === JSON.stringify(right.openPastedLabels);
+    && JSON.stringify(left.pastedBlocks) === JSON.stringify(right.pastedBlocks);
 
   const editHistoryForDraft = (targetDraftKey: string): ComposerEditHistory => {
     const existing = editHistoryByDraftRef.current[targetDraftKey];
     if (existing) return existing;
-    const created: ComposerEditHistory = { undo: [], redo: [] };
+    const created: ComposerEditHistory = {
+      undo: [],
+      redo: [],
+      undoNativeBarrier: false,
+      redoNativeBarrier: false,
+    };
     editHistoryByDraftRef.current[targetDraftKey] = created;
     return created;
   };
 
-  const discardComposerRedo = (targetDraftKey: string) => {
+  const clearComposerEditHistory = (targetDraftKey: string) => {
+    delete editHistoryByDraftRef.current[targetDraftKey];
+  };
+
+  const syncComposerNativeHistory = (targetDraftKey: string, inputType?: string) => {
     const history = editHistoryByDraftRef.current[targetDraftKey];
-    if (history) history.redo = [];
+    if (!history) return;
+    const current = composerEditSnapshot(targetDraftKey);
+    const undoTransaction = history.undo[history.undo.length - 1];
+    const redoTransaction = history.redo[history.redo.length - 1];
+
+    if (inputType === "historyUndo") {
+      history.undoNativeBarrier = Boolean(
+        undoTransaction && !composerEditStateMatches(current, undoTransaction.after),
+      );
+      // The browser has just created at least one native redo unit. Keep it
+      // ahead of any older custom redo transaction until historyRedo reaches
+      // that transaction's boundary again.
+      history.redoNativeBarrier = history.undo.length > 0 || history.redo.length > 0;
+      return;
+    }
+
+    if (inputType === "historyRedo") {
+      history.undoNativeBarrier = Boolean(
+        undoTransaction && !composerEditStateMatches(current, undoTransaction.after),
+      );
+      if (redoTransaction) {
+        history.redoNativeBarrier = !composerEditStateMatches(current, redoTransaction.before);
+      } else if (undoTransaction) {
+        history.redoNativeBarrier = !composerEditStateMatches(current, undoTransaction.after);
+      } else {
+        history.redoNativeBarrier = false;
+      }
+      return;
+    }
+
+    // A new browser edit sits above the latest custom transaction even when
+    // its net text later returns to the same value (type then Backspace).
+    history.undoNativeBarrier = history.undo.length > 0;
+    history.redo = [];
+    history.redoNativeBarrier = false;
   };
 
   const recordComposerEdit = (
@@ -895,9 +943,24 @@ export function Composer({
   ) => {
     if (composerEditStateMatches(before, after)) return;
     const history = editHistoryForDraft(targetDraftKey);
-    history.undo.push({ before, after });
+    const previous = history.undo[history.undo.length - 1];
+    const nativeBarrierBefore = Boolean(
+      previous
+      && (
+        history.undoNativeBarrier
+        || !composerEditStateMatches(before, previous.after)
+      ),
+    );
+    history.undo.push({
+      before,
+      after,
+      nativeBarrierBefore,
+      nativeBarrierAfter: false,
+    });
     if (history.undo.length > MAX_COMPOSER_EDIT_HISTORY) history.undo.shift();
     history.redo = [];
+    history.undoNativeBarrier = false;
+    history.redoNativeBarrier = false;
   };
 
   const restoreComposerEdit = (targetDraftKey: string, snapshot: ComposerEditSnapshot) => {
@@ -1428,10 +1491,19 @@ export function Composer({
     setComposerSelection(textRef.current.length);
   };
 
-  const setTextCaretEnd = (next: string) => {
+  const setTextCaretEnd = (next: string, trackEdit = true) => {
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = trackEdit ? composerEditSnapshot(targetDraftKey) : null;
     textRef.current = next;
     setText(next);
     setComposerSelection(next.length);
+    if (beforeEdit) {
+      recordComposerEdit(
+        targetDraftKey,
+        beforeEdit,
+        composerEditSnapshot(targetDraftKey, { start: next.length, end: next.length }),
+      );
+    }
   };
 
   const rememberCaret = () => {
@@ -1447,35 +1519,51 @@ export function Composer({
 
   const insertNewlineAtCaret = () => {
     const selection = getComposerSelection();
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey, selection);
     const updated = insertComposerNewline(textRef.current, invocationsRef.current, selection);
     textRef.current = updated.text;
     invocationsRef.current = updated.invocations;
     setText(updated.text);
     setInvocations(updated.invocations);
-    setComposerSelection(selection.start + 1);
+    const caret = selection.start + 1;
+    setComposerSelection(caret);
+    recordComposerEdit(
+      targetDraftKey,
+      beforeEdit,
+      composerEditSnapshot(targetDraftKey, { start: caret, end: caret }),
+    );
   };
 
   const insertTextAtCaret = (snippet: string) => {
     const selection = getComposerSelection();
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey, selection);
     const start = selection.start;
     const end = selection.end;
-    const before = text.slice(0, start);
-    const after = text.slice(end);
+    const current = textRef.current;
+    const before = current.slice(0, start);
+    const after = current.slice(end);
     const leading = before.length === 0 || before.endsWith("\n\n") ? "" : before.endsWith("\n") ? "\n" : "\n\n";
     const body = snippet.trimEnd();
     const trailing = after.length === 0 ? "\n" : after.startsWith("\n") ? "" : "\n\n";
     const inserted = leading + body + trailing;
     const pos = before.length + inserted.length;
-    const updated = replaceInvocationTextRange(text, invocationsRef.current, start, end, inserted);
+    const updated = replaceInvocationTextRange(current, invocationsRef.current, start, end, inserted);
     textRef.current = updated.text;
     invocationsRef.current = updated.invocations;
     setText(updated.text);
     setInvocations(updated.invocations);
     setComposerSelection(pos);
+    recordComposerEdit(
+      targetDraftKey,
+      beforeEdit,
+      composerEditSnapshot(targetDraftKey, { start: pos, end: pos }),
+    );
   };
 
   const replaceComposerText = (next: string) => {
-    delete editHistoryByDraftRef.current[activeDraftKeyRef.current];
+    clearComposerEditHistory(activeDraftKeyRef.current);
     clearAttachments();
     setWorkspaceRefs([]);
     setSessionRefs([]);
@@ -1484,7 +1572,7 @@ export function Composer({
     pastedBlocksRef.current = [];
     setPastedBlocks([]);
     setOpenPastedLabels([]);
-    setTextCaretEnd(next);
+    setTextCaretEnd(next, false);
   };
 
   const addWorkspaceReference = (ref: WorkspaceReference) => {
@@ -1616,7 +1704,7 @@ export function Composer({
   };
 
   const clearSubmittedDraft = (targetDraftKey: string) => {
-    delete editHistoryByDraftRef.current[targetDraftKey];
+    clearComposerEditHistory(targetDraftKey);
     if (targetDraftKey === activeDraftKeyRef.current) {
       textRef.current = "";
       setText("");
@@ -2022,7 +2110,14 @@ export function Composer({
       const lines = lineCount(pasted);
       const label = t("composer.pastedLabel", { id, lines });
       const block: PastedBlock = { label, text: pasted }; // keep raw text (CRLF preserved)
-      const next = replaceInvocationTextRange(text, invocationsRef.current, start, end, label, selection.afterInvocationId);
+      const next = replaceInvocationTextRange(
+        textRef.current,
+        invocationsRef.current,
+        start,
+        end,
+        label,
+        selection.afterInvocationId,
+      );
       pastedBlocksRef.current = [...pastedBlocksRef.current, block];
       setPastedBlocks((prev) => [...prev, block]);
       textRef.current = next.text;
@@ -2037,7 +2132,14 @@ export function Composer({
       // programmatic edit below while leaving ordinary typing in the native
       // history.
       resetPromptHistoryNavigation();
-      const next = replaceInvocationTextRange(text, invocationsRef.current, start, end, normalizedPasted, selection.afterInvocationId);
+      const next = replaceInvocationTextRange(
+        textRef.current,
+        invocationsRef.current,
+        start,
+        end,
+        normalizedPasted,
+        selection.afterInvocationId,
+      );
       textRef.current = next.text;
       invocationsRef.current = next.invocations;
       setText(next.text);
@@ -2061,7 +2163,7 @@ export function Composer({
     return {
       from,
       to,
-      selected: text.slice(from, to),
+      selected: textRef.current.slice(from, to),
       afterInvocationId: start === end ? selection.afterInvocationId : undefined,
     };
   };
@@ -2077,7 +2179,6 @@ export function Composer({
     targetDraftKey = activeDraftKeyRef.current,
     afterInvocationId?: string,
   ) => {
-    discardComposerRedo(targetDraftKey);
     if (targetDraftKey === activeDraftKeyRef.current) {
       const current = textRef.current;
       const next = replaceInvocationTextRange(
@@ -2401,6 +2502,8 @@ export function Composer({
       setRichSlashQuery(null);
       return;
     }
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey);
     const invocation: ComposerInvocation = {
       id: `composer-invocation-${nextInvocationId.current++}`,
       offset: 0,
@@ -2411,6 +2514,11 @@ export function Composer({
     setText("");
     setInvocations([invocation]);
     setRichSlashQuery(null);
+    recordComposerEdit(
+      targetDraftKey,
+      beforeEdit,
+      composerEditSnapshot(targetDraftKey, { start: 0, end: 0, afterInvocationId: invocation.id }),
+    );
     requestAnimationFrame(() => richInputRef.current?.setSelectionRange(0));
   };
 
@@ -2424,13 +2532,17 @@ export function Composer({
   };
 
   const togglePastedPreview = (label: string) => {
-    setOpenPastedLabels((prev) => (prev.includes(label) ? prev.filter((x) => x !== label) : [...prev, label]));
+    setOpenPastedLabels((prev) => {
+      const next = prev.includes(label) ? prev.filter((x) => x !== label) : [...prev, label];
+      openPastedLabelsRef.current = next;
+      return next;
+    });
   };
 
-  const replacePastedBlockLabel = (block: PastedBlock, replacement: string) => {
+  const replacePastedBlockLabel = (block: PastedBlock, replacement: string): number | null => {
     const current = textRef.current;
     const start = current.indexOf(block.label);
-    if (start < 0) return;
+    if (start < 0) return null;
     const next = replaceInvocationTextRange(
       current,
       invocationsRef.current,
@@ -2443,20 +2555,45 @@ export function Composer({
     setText(next.text);
     setInvocations(next.invocations);
     setComposerSelection(next.text.length);
+    return next.text.length;
   };
 
   const removePastedBlock = (block: PastedBlock) => {
-    pastedBlocksRef.current = pastedBlocksRef.current.filter((x) => x.label !== block.label);
-    setPastedBlocks((prev) => prev.filter((x) => x.label !== block.label));
-    setOpenPastedLabels((prev) => prev.filter((x) => x !== block.label));
-    replacePastedBlockLabel(block, "");
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey);
+    const nextBlocks = pastedBlocksRef.current.filter((x) => x.label !== block.label);
+    const nextOpenLabels = openPastedLabelsRef.current.filter((x) => x !== block.label);
+    pastedBlocksRef.current = nextBlocks;
+    openPastedLabelsRef.current = nextOpenLabels;
+    setPastedBlocks(nextBlocks);
+    setOpenPastedLabels(nextOpenLabels);
+    const caret = replacePastedBlockLabel(block, "");
+    if (caret !== null) {
+      recordComposerEdit(
+        targetDraftKey,
+        beforeEdit,
+        composerEditSnapshot(targetDraftKey, { start: caret, end: caret }),
+      );
+    }
   };
 
   const expandPastedBlock = (block: PastedBlock) => {
-    pastedBlocksRef.current = pastedBlocksRef.current.filter((x) => x.label !== block.label);
-    setPastedBlocks((prev) => prev.filter((x) => x.label !== block.label));
-    setOpenPastedLabels((prev) => prev.filter((x) => x !== block.label));
-    replacePastedBlockLabel(block, block.text);
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey);
+    const nextBlocks = pastedBlocksRef.current.filter((x) => x.label !== block.label);
+    const nextOpenLabels = openPastedLabelsRef.current.filter((x) => x !== block.label);
+    pastedBlocksRef.current = nextBlocks;
+    openPastedLabelsRef.current = nextOpenLabels;
+    setPastedBlocks(nextBlocks);
+    setOpenPastedLabels(nextOpenLabels);
+    const caret = replacePastedBlockLabel(block, block.text);
+    if (caret !== null) {
+      recordComposerEdit(
+        targetDraftKey,
+        beforeEdit,
+        composerEditSnapshot(targetDraftKey, { start: caret, end: caret }),
+      );
+    }
   };
 
   useEffect(() => {
@@ -2669,6 +2806,12 @@ export function Composer({
 
   const insertContentTrigger = (trigger: "@" | "#" | "/") => {
     const selection = getInputSelection();
+    const targetDraftKey = activeDraftKeyRef.current;
+    const beforeEdit = composerEditSnapshot(targetDraftKey, {
+      start: selection.from,
+      end: selection.to,
+      afterInvocationId: selection.afterInvocationId,
+    });
     const current = textRef.current;
     const needsSpace = selection.from > 0 && !/\s/.test(current.charAt(selection.from - 1));
     const value = `${needsSpace ? " " : ""}${trigger}`;
@@ -2680,8 +2823,14 @@ export function Composer({
       value,
       selection.from,
       selection.to,
-      activeDraftKeyRef.current,
+      targetDraftKey,
       selection.afterInvocationId,
+    );
+    const caret = selection.from + value.length;
+    recordComposerEdit(
+      targetDraftKey,
+      beforeEdit,
+      composerEditSnapshot(targetDraftKey, { start: caret, end: caret }),
     );
     if (trigger === "#") {
       setDirectPastChats(true);
@@ -2910,10 +3059,16 @@ export function Composer({
           setHistoryIndex(next);
           setTextCaretEnd(historyText ?? savedTextRef.current);
         } else {
+          const beforeEdit = composerEditSnapshot(sourceDraftKey);
           const draft = cloneComposerDraft(draftsBySessionRef.current[sourceDraftKey] ?? emptyComposerDraft());
           draft.historyIndex = next;
           draft.text = historyText ?? draft.savedText;
           draftsBySessionRef.current[sourceDraftKey] = draft;
+          recordComposerEdit(
+            sourceDraftKey,
+            beforeEdit,
+            composerEditSnapshot(sourceDraftKey, { start: draft.text.length, end: draft.text.length }),
+          );
         }
         if (historyDirection === "up" && historyEntriesRef.current.length - 1 - next <= PROMPT_HISTORY_PREFETCH_REMAINING) {
           prefetchPromptHistoryTail();
@@ -2982,24 +3137,68 @@ export function Composer({
       handleCancel();
     }
 
-    // Browser undo handles normal typing. Programmatic paste/cut transactions
-    // are intercepted only when the current state exactly matches their
-    // boundary, so typing after a paste is undone natively first.
+    // Browser undo owns ordinary DOM edits, while programmatic composer edits
+    // live in the per-draft transaction stacks. Native barriers preserve the
+    // real ordering even when later browser edits happen to return to the same
+    // text (for example type then Backspace).
     const primaryModifier = shortcutPlatform === "darwin" ? e.metaKey : e.ctrlKey;
     const undoShortcut = primaryModifier && !e.shiftKey && e.key.toLowerCase() === "z";
-    const redoShortcut = primaryModifier && e.shiftKey && e.key.toLowerCase() === "z";
+    const redoShortcut = (primaryModifier && e.shiftKey && e.key.toLowerCase() === "z")
+      || (
+        shortcutPlatform !== "darwin"
+        && e.ctrlKey
+        && !e.metaKey
+        && !e.altKey
+        && !e.shiftKey
+        && e.key.toLowerCase() === "y"
+      );
     if (!composing && (undoShortcut || redoShortcut)) {
       const targetDraftKey = activeDraftKeyRef.current;
       const history = editHistoryForDraft(targetDraftKey);
-      const stack = undoShortcut ? history.undo : history.redo;
-      const transaction = stack[stack.length - 1];
-      const expected = undoShortcut ? transaction?.after : transaction?.before;
-      if (transaction && expected && composerEditStateMatches(composerEditSnapshot(targetDraftKey), expected)) {
+      const current = composerEditSnapshot(targetDraftKey);
+
+      if (undoShortcut) {
+        const transaction = history.undo[history.undo.length - 1];
+        if (history.undoNativeBarrier) return;
+        if (!transaction) return;
+        if (!composerEditStateMatches(current, transaction.after)) {
+          // A programmatic owner changed state without joining either history.
+          // Do not let a stale browser entry mutate that unknown boundary.
+          e.preventDefault();
+          return;
+        }
         e.preventDefault();
-        stack.pop();
-        (undoShortcut ? history.redo : history.undo).push(transaction);
-        restoreComposerEdit(targetDraftKey, undoShortcut ? transaction.before : transaction.after);
+        history.undo.pop();
+        transaction.nativeBarrierAfter = history.redoNativeBarrier;
+        history.redo.push(transaction);
+        restoreComposerEdit(targetDraftKey, transaction.before);
+        const previous = history.undo[history.undo.length - 1];
+        history.undoNativeBarrier = Boolean(previous && transaction.nativeBarrierBefore);
+        history.redoNativeBarrier = false;
+        return;
       }
+
+      const transaction = history.redo[history.redo.length - 1];
+      if (history.redoNativeBarrier) return;
+      if (!transaction) {
+        // A custom edit is a new branch and invalidates native redo entries
+        // that the browser cannot see. With no custom history, native redo
+        // remains fully browser-owned.
+        if (history.undo.length > 0) e.preventDefault();
+        return;
+      }
+      if (!composerEditStateMatches(current, transaction.before)) {
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault();
+      history.redo.pop();
+      history.undo.push(transaction);
+      restoreComposerEdit(targetDraftKey, transaction.after);
+      history.undoNativeBarrier = false;
+      const next = history.redo[history.redo.length - 1];
+      history.redoNativeBarrier = transaction.nativeBarrierAfter
+        || Boolean(next && next.nativeBarrierBefore);
     }
   };
 
@@ -3819,14 +4018,30 @@ export function Composer({
                   placeholder={composerPlaceholder}
                   disabled={disabled || readOnly}
                   style={textareaStyle}
-                  onChange={(nextText, nextInvocations) => {
-                    discardComposerRedo(activeDraftKeyRef.current);
+                  onChange={(
+                    nextText,
+                    nextInvocations,
+                    origin: RichComposerChangeOrigin,
+                  ) => {
+                    const targetDraftKey = activeDraftKeyRef.current;
+                    const beforeEdit = origin.source === "programmatic"
+                      ? composerEditSnapshot(targetDraftKey, origin.beforeSelection)
+                      : null;
                     resetPromptHistoryNavigation();
                     const hadInvocations = invocationsRef.current.length > 0;
                     textRef.current = nextText;
                     invocationsRef.current = nextInvocations;
                     setText(nextText);
                     setInvocations(nextInvocations);
+                    if (beforeEdit) {
+                      recordComposerEdit(
+                        targetDraftKey,
+                        beforeEdit,
+                        composerEditSnapshot(targetDraftKey, origin.afterSelection),
+                      );
+                    } else {
+                      syncComposerNativeHistory(targetDraftKey, origin.inputType);
+                    }
                     if (composerPrompt) setComposerPrompt(null);
                     if (hadInvocations && nextInvocations.length === 0) {
                       // Removing the last entity unmounts the rich input and
@@ -3860,11 +4075,18 @@ export function Composer({
                   className="composer__input"
                   aria-label={t("composer.placeholder")}
                   value={text}
+                  onInputCapture={(e) => {
+                    pendingNativeInputTypeRef.current = (e.nativeEvent as InputEvent).inputType;
+                  }}
                   onChange={(e) => {
-                    discardComposerRedo(activeDraftKeyRef.current);
+                    const targetDraftKey = activeDraftKeyRef.current;
+                    const inputType = (e.nativeEvent as InputEvent).inputType
+                      || pendingNativeInputTypeRef.current;
+                    pendingNativeInputTypeRef.current = undefined;
                     resetPromptHistoryNavigation();
                     textRef.current = e.target.value;
                     setText(e.target.value);
+                    syncComposerNativeHistory(targetDraftKey, inputType);
                     if (composerPrompt) setComposerPrompt(null);
                   }}
                   onSelect={rememberCaret}

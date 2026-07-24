@@ -24,6 +24,13 @@ export type RichComposerSelection = {
   afterInvocationId?: string;
 };
 
+export type RichComposerChangeOrigin = {
+  source: "browser" | "programmatic";
+  inputType?: string;
+  beforeSelection: RichComposerSelection;
+  afterSelection: RichComposerSelection;
+};
+
 export type RichSlashQuery = {
   from: number;
   to: number;
@@ -479,7 +486,11 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
   placeholder: string;
   disabled: boolean;
   style?: CSSProperties;
-  onChange: (text: string, invocations: ComposerInvocation[]) => void;
+  onChange: (
+    text: string,
+    invocations: ComposerInvocation[],
+    origin: RichComposerChangeOrigin,
+  ) => void;
   onSelectionChange: (selection: RichComposerSelection, slashQuery: RichSlashQuery | null) => void;
   onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   onPaste: (event: ClipboardEvent<HTMLDivElement>) => void;
@@ -554,8 +565,13 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
 
   const replaceRange = (value: string, start: number, end: number) => {
     const next = replaceInvocationTextRange(text, invocations, start, end, value);
-    pendingSelectionRef.current = { start: start + value.length, end: start + value.length };
-    onChange(next.text, next.invocations);
+    const afterSelection = { start: start + value.length, end: start + value.length };
+    pendingSelectionRef.current = afterSelection;
+    onChange(next.text, next.invocations, {
+      source: "programmatic",
+      beforeSelection: { start, end },
+      afterSelection,
+    });
   };
 
   useImperativeHandle(ref, () => ({
@@ -582,8 +598,13 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
       const next = replaceInvocationTextRange(text, invocations, query.from, query.to, "");
       const id = `invocation-${nextInvocationID++}`;
       const invocation: ComposerInvocation = { id, offset: query.from, command };
-      pendingSelectionRef.current = { start: query.from, end: query.from, afterInvocationId: id };
-      onChange(next.text, sortComposerInvocations([...next.invocations, invocation]));
+      const afterSelection = { start: query.from, end: query.from, afterInvocationId: id };
+      pendingSelectionRef.current = afterSelection;
+      onChange(next.text, sortComposerInvocations([...next.invocations, invocation]), {
+        source: "programmatic",
+        beforeSelection: { start: query.from, end: query.to },
+        afterSelection,
+      });
     },
     scrollHeight: () => rootRef.current?.scrollHeight ?? 0,
   }), [invocations, known, text]);
@@ -675,7 +696,12 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
     domModelRef.current = next;
     pendingSelectionRef.current = selection;
     onSelectionChange(selection, slashQueryAt(next.text, selection));
-    onChange(next.text, next.invocations);
+    onChange(next.text, next.invocations, {
+      source: "browser",
+      inputType: snapshot?.inputType,
+      beforeSelection: snapshot?.selection ?? lastValidSelectionRef.current,
+      afterSelection: selection,
+    });
   };
 
   const cancelCompositionFinalize = () => {
@@ -796,9 +822,14 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
           if (target && target.offset === selection.start) {
             event.preventDefault();
             const next = invocations.filter((invocation) => invocation.id !== target.id);
-            pendingSelectionRef.current = { start: selection.start, end: selection.start };
-            onSelectionChange({ start: selection.start, end: selection.start }, null);
-            onChange(text, next);
+            const afterSelection = { start: selection.start, end: selection.start };
+            pendingSelectionRef.current = afterSelection;
+            onSelectionChange(afterSelection, null);
+            onChange(text, next, {
+              source: "programmatic",
+              beforeSelection: selection,
+              afterSelection,
+            });
             return;
           }
         }
@@ -828,9 +859,14 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
           onRemove={() => {
             const current = known.get(item.id);
             const currentOffset = current?.offset ?? offset;
-            pendingSelectionRef.current = { start: currentOffset, end: currentOffset };
-            onSelectionChange({ start: currentOffset, end: currentOffset }, null);
-            onChange(text, invocations.filter((candidate) => candidate.id !== item.id));
+            const afterSelection = { start: currentOffset, end: currentOffset };
+            pendingSelectionRef.current = afterSelection;
+            onSelectionChange(afterSelection, null);
+            onChange(text, invocations.filter((candidate) => candidate.id !== item.id), {
+              source: "programmatic",
+              beforeSelection: lastValidSelectionRef.current,
+              afterSelection,
+            });
           }}
           variant="composer"
         />
