@@ -31,19 +31,13 @@ export function findCodeMatches(
   query: string,
   caseSensitive = false,
   wholeWord = false,
-  useRegex = false,
   maxMatches = MAX_SEARCH_MATCHES,
 ): CodeSearchResult {
   if (!query) return { matches: [], truncated: false };
 
   const matches: CodeSearchMatch[] = [];
   const lines = typeof source === "string" ? source.split("\n") : source;
-  let pattern: RegExp;
-  try {
-    pattern = new RegExp(useRegex ? query : escapeRegex(query), caseSensitive ? "gu" : "giu");
-  } catch {
-    return { matches: [], truncated: false };
-  }
+  const pattern = new RegExp(escapeRegex(query), caseSensitive ? "gu" : "giu");
   let absoluteOffset = 0;
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -55,7 +49,7 @@ export function findCodeMatches(
       const end = start + match[0].length;
       const startsInsideWord = start > 0 && isWordCharacter(codePointBefore(line, start));
       const endsInsideWord = end < line.length && isWordCharacter(codePointAt(line, end));
-      if (useRegex || !wholeWord || (!startsInsideWord && !endsInsideWord)) {
+      if (!wholeWord || (!startsInsideWord && !endsInsideWord)) {
         if (matches.length >= maxMatches) {
           return { matches, truncated: true };
         }
@@ -216,14 +210,13 @@ export default function LineNumberCode({
   const [searchQuery, setSearchQuery] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
-  const [useRegex, setUseRegex] = useState(false);
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const searchTimerRef = useRef<number | null>(null);
 
   const searchResult = useMemo(
-    () => findCodeMatches(lines, searchQuery, caseSensitive, wholeWord, useRegex),
-    [lines, searchQuery, caseSensitive, wholeWord, useRegex],
+    () => findCodeMatches(lines, searchQuery, caseSensitive, wholeWord),
+    [lines, searchQuery, caseSensitive, wholeWord],
   );
   const matches = searchResult.matches;
   const totalMatches = matches.length;
@@ -436,7 +429,7 @@ export default function LineNumberCode({
             className={`code-search__toggle${wholeWord ? " code-search__toggle--on" : ""}`}
             onClick={() => {
               setCurrentMatchIdx(0);
-              setWholeWord((enabled) => { if (useRegex && !enabled) setUseRegex(false); return !enabled; });
+              setWholeWord((enabled) => !enabled);
             }}
             aria-label={t("workspace.searchWholeWord")}
             aria-pressed={wholeWord}
@@ -444,19 +437,6 @@ export default function LineNumberCode({
             type="button"
           >
             ab
-          </button>
-          <button
-            className={`code-search__toggle${useRegex ? " code-search__toggle--on" : ""}`}
-            onClick={() => {
-              setCurrentMatchIdx(0);
-              setUseRegex((enabled) => { if (wholeWord && !enabled) setWholeWord(false); return !enabled; });
-            }}
-            aria-label={t("workspace.searchUseRegex")}
-            aria-pressed={useRegex}
-            title={t("workspace.searchUseRegex")}
-            type="button"
-          >
-            *
           </button>
 
           {query && !searchPending && totalMatches > 0 && (

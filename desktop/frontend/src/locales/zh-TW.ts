@@ -122,7 +122,6 @@ export const zhTW: Record<DictKey, string> = {
   "workspace.searchNext": "下一個符合項目",
   "workspace.searchMatchCase": "區分大小寫",
   "workspace.searchWholeWord": "全字拼寫須相符",
-  "workspace.searchUseRegex": "Regex",
   "workspace.searchClose": "關閉尋找",
   "workspace.searchNoResults": "無結果",
   "workspace.codeLine": "第 {line} 行",

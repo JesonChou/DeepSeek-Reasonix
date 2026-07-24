@@ -198,7 +198,6 @@ export const en = {
   "workspace.searchNext": "Next match",
   "workspace.searchMatchCase": "Match case",
   "workspace.searchWholeWord": "Match whole word",
-  "workspace.searchUseRegex": "Use regex",
   "workspace.searchClose": "Close search",
   "workspace.searchNoResults": "No results",
   "workspace.codeLine": "Line {line}",

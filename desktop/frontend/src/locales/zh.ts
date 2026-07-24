@@ -199,7 +199,6 @@ export const zh: Record<DictKey, string> = {
   "workspace.searchNext": "下一个匹配项",
   "workspace.searchMatchCase": "区分大小写",
   "workspace.searchWholeWord": "全词匹配",
-  "workspace.searchUseRegex": "正则",
   "workspace.searchClose": "关闭查找",
   "workspace.searchNoResults": "无结果",
   "workspace.codeLine": "第 {line} 行",
