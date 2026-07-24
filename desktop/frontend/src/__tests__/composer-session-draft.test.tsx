@@ -1086,7 +1086,7 @@ console.log("\ncomposer session draft");
   textarea().setSelectionRange(2, 2);
   const menuItems = await openComposerInputMenu();
   await act(async () => {
-    menuItems[2]?.click();
+    menuItems[4]?.click();
     await flushTimers();
   });
   await rerender({
@@ -1133,7 +1133,7 @@ console.log("\ncomposer session draft");
   textarea().setSelectionRange(1, 4);
   const menuItems = await openComposerInputMenu();
   await act(async () => {
-    menuItems[0]?.click();
+    menuItems[2]?.click();
     await clipboardWriteStarted.promise;
   });
   await rerender({

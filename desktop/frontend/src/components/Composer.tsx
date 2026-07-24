@@ -649,6 +649,9 @@ export function Composer({
   const { showToast } = useToast();
   const shortcutPlatform = useMemo(() => detectShortcutPlatform(), []);
   const sendComboLabel = useShortcutComboLabel("composer.send");
+  const undoComboLabel = useShortcutComboLabel("composer.undo");
+  const redoComboLabel = useShortcutComboLabel("composer.redo");
+  const yoloComboLabel = useShortcutComboLabel("toolApproval.yolo");
   const draftKey = sessionKey || tabId || DEFAULT_COMPOSER_DRAFT_KEY;
   const now = useTick(running);
   const [text, setText] = useState("");
@@ -993,6 +996,54 @@ export function Composer({
       snapshot.selection.end,
       snapshot.selection.afterInvocationId,
     );
+  };
+
+  const canUndoComposerEdit = (targetDraftKey: string): boolean => {
+    const history = editHistoryByDraftRef.current[targetDraftKey];
+    if (!history || history.undoNativeBarrier) return false;
+    const transaction = history.undo[history.undo.length - 1];
+    return Boolean(
+      transaction
+      && composerEditStateMatches(composerEditSnapshot(targetDraftKey), transaction.after),
+    );
+  };
+
+  const undoComposerEdit = (targetDraftKey: string): boolean => {
+    const history = editHistoryByDraftRef.current[targetDraftKey];
+    if (!history || !canUndoComposerEdit(targetDraftKey)) return false;
+    const transaction = history.undo.pop();
+    if (!transaction) return false;
+    transaction.nativeBarrierAfter = history.redoNativeBarrier;
+    history.redo.push(transaction);
+    restoreComposerEdit(targetDraftKey, transaction.before);
+    const previous = history.undo[history.undo.length - 1];
+    history.undoNativeBarrier = Boolean(previous && transaction.nativeBarrierBefore);
+    history.redoNativeBarrier = false;
+    return true;
+  };
+
+  const canRedoComposerEdit = (targetDraftKey: string): boolean => {
+    const history = editHistoryByDraftRef.current[targetDraftKey];
+    if (!history || history.redoNativeBarrier) return false;
+    const transaction = history.redo[history.redo.length - 1];
+    return Boolean(
+      transaction
+      && composerEditStateMatches(composerEditSnapshot(targetDraftKey), transaction.before),
+    );
+  };
+
+  const redoComposerEdit = (targetDraftKey: string): boolean => {
+    const history = editHistoryByDraftRef.current[targetDraftKey];
+    if (!history || !canRedoComposerEdit(targetDraftKey)) return false;
+    const transaction = history.redo.pop();
+    if (!transaction) return false;
+    history.undo.push(transaction);
+    restoreComposerEdit(targetDraftKey, transaction.after);
+    history.undoNativeBarrier = false;
+    const next = history.redo[history.redo.length - 1];
+    history.redoNativeBarrier = transaction.nativeBarrierAfter
+      || Boolean(next && next.nativeBarrierBefore);
+    return true;
   };
 
   const updatePendingGuidanceForDraft = (
@@ -3141,9 +3192,8 @@ export function Composer({
     // live in the per-draft transaction stacks. Native barriers preserve the
     // real ordering even when later browser edits happen to return to the same
     // text (for example type then Backspace).
-    const primaryModifier = shortcutPlatform === "darwin" ? e.metaKey : e.ctrlKey;
-    const undoShortcut = primaryModifier && !e.shiftKey && e.key.toLowerCase() === "z";
-    const redoShortcut = (primaryModifier && e.shiftKey && e.key.toLowerCase() === "z")
+    const undoShortcut = matchesShortcut(e.nativeEvent, "composer.undo", shortcutPlatform);
+    const redoShortcut = matchesShortcut(e.nativeEvent, "composer.redo", shortcutPlatform)
       || (
         shortcutPlatform !== "darwin"
         && e.ctrlKey
@@ -3168,13 +3218,7 @@ export function Composer({
           return;
         }
         e.preventDefault();
-        history.undo.pop();
-        transaction.nativeBarrierAfter = history.redoNativeBarrier;
-        history.redo.push(transaction);
-        restoreComposerEdit(targetDraftKey, transaction.before);
-        const previous = history.undo[history.undo.length - 1];
-        history.undoNativeBarrier = Boolean(previous && transaction.nativeBarrierBefore);
-        history.redoNativeBarrier = false;
+        undoComposerEdit(targetDraftKey);
         return;
       }
 
@@ -3192,13 +3236,7 @@ export function Composer({
         return;
       }
       e.preventDefault();
-      history.redo.pop();
-      history.undo.push(transaction);
-      restoreComposerEdit(targetDraftKey, transaction.after);
-      history.undoNativeBarrier = false;
-      const next = history.redo[history.redo.length - 1];
-      history.redoNativeBarrier = transaction.nativeBarrierAfter
-        || Boolean(next && next.nativeBarrierBefore);
+      redoComposerEdit(targetDraftKey);
     }
   };
 
@@ -3423,6 +3461,30 @@ export function Composer({
       shortcutPlatform,
     );
   const inputMenuItems: ContextMenuItem[] = [
+    {
+      key: "undo",
+      label: t("shortcuts.action.composerUndo"),
+      shortcut: undoComboLabel,
+      disabled: disabled || !canUndoComposerEdit(activeDraftKeyRef.current),
+      onSelect: () => {
+        setInputMenuPoint(null);
+        undoComposerEdit(activeDraftKeyRef.current);
+      },
+    },
+    {
+      key: "redo",
+      label: t("shortcuts.action.composerRedo"),
+      shortcut: redoComboLabel,
+      disabled: disabled || !canRedoComposerEdit(activeDraftKeyRef.current),
+      onSelect: () => {
+        setInputMenuPoint(null);
+        redoComposerEdit(activeDraftKeyRef.current);
+      },
+    },
+    {
+      type: "separator",
+      key: "edit-history-separator",
+    },
     {
       key: "cut",
       label: t("common.cut"),
@@ -4212,7 +4274,11 @@ export function Composer({
                   bar stays usable so mode changes remain possible mid-prompt;
                   the approval card explains that the pending request still needs
                   an explicit decision. */}
-              <div className="composer-modebar composer-modebar--approval" data-mode={toolApprovalMode} title={t("composer.accessMenuTitle")}>
+              <div
+                className="composer-modebar composer-modebar--approval"
+                data-mode={toolApprovalMode}
+                title={t("composer.accessMenuTitle", { shortcut: yoloComboLabel })}
+              >
                 <span className="composer-modebar__thumb" aria-hidden="true" />
                 <button
                   type="button"
@@ -4242,7 +4308,7 @@ export function Composer({
                   onClick={() => chooseApprovalMode("yolo")}
                   disabled={approvalBarDisabled}
                   aria-pressed={toolApprovalMode === "yolo"}
-                  title={t("composer.accessYoloTitle")}
+                  title={t("composer.accessYoloTitle", { shortcut: yoloComboLabel })}
                 >
                   <ShieldAlert size={14} />
                   <span>{t("composer.modeYolo")}</span>
