@@ -35,7 +35,6 @@ import {
   type FontFamily,
   type MonoFontFamily,
 } from "../lib/fontFamily";
-import { applyTypographyPreferences, getTypographyPreferences } from "../lib/typographyPreferences";
 import { getDisplayMode, onDisplayModeChange, setDisplayMode as setLocalDisplayMode } from "../lib/displayMode";
 import { getProcessFoldPreference, onProcessFoldPreferenceChange, setProcessFoldPreference, type ProcessFoldPreference } from "../lib/processFoldPreference";
 import { DEFAULT_STATUS_BAR_ITEMS, normalizeStatusBarItems, type StatusBarItemId } from "../lib/statusBarItems";
@@ -331,14 +330,6 @@ export function SettingsPanel({
                       onMonoFontFamily={(font) => {
                         applyMonoFontFamily(font);
                         setMonoFontFamilyState(font);
-                        // Sync: when the user picks a new global monospace font,
-                        // reset any TypographySettings code-region override so the
-                        // global choice reaches code blocks.
-                        const tp = getTypographyPreferences();
-                        if (!tp.code.followGlobal) {
-                          tp.code.followGlobal = true;
-                          applyTypographyPreferences(tp);
-                        }
                       }}
                       onCustomFontNameChange={(name) => {
                         setCustomFontNameState(name);
