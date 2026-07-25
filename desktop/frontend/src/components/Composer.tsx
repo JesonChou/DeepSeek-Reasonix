@@ -8,7 +8,7 @@ import { app, onFilesDropped } from "../lib/bridge";
 import { canUsePromptHistory, composerEnterAction, insertComposerNewline, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
 import { cacheGeneration, loadOlder } from "../lib/composerHistory";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
-import { detectShortcutPlatform, formatShortcutCombo, matchesShortcut, useShortcutComboLabel } from "../lib/keyboardShortcuts";
+import { detectShortcutPlatform, formatShortcutCombo, isReservedComposerHistoryShortcut, matchesShortcut, useShortcutComboLabel } from "../lib/keyboardShortcuts";
 import { fallbackCopyText } from "../lib/clipboard";
 import {
   commandUsesStructuredInvocation,
@@ -3043,7 +3043,11 @@ export function Composer({
       return;
     }
 
-    if (matchesShortcut(e.nativeEvent, "toolApproval.yolo", shortcutPlatform) && !composing) {
+    if (
+      !composing
+      && !isReservedComposerHistoryShortcut(e.nativeEvent, shortcutPlatform)
+      && matchesShortcut(e.nativeEvent, "toolApproval.yolo", shortcutPlatform)
+    ) {
       e.preventDefault();
       onToggleYoloApprovalMode();
       return;

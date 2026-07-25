@@ -799,7 +799,7 @@ console.log("\ncomposer session draft");
     resetCustomShortcuts();
     await flushTimers();
   });
-  saveCustomShortcut("toolApproval.yolo", { key: "u", ctrl: true });
+  saveCustomShortcut("toolApproval.yolo", { key: "z", ctrl: true });
   let yoloToggles = 0;
   const { root } = await renderComposer({
     onToggleYoloApprovalMode: () => {
@@ -818,6 +818,39 @@ console.log("\ncomposer session draft");
   });
   await act(async () => {
     textarea().dispatchEvent(undoPaste);
+    await flushTimers();
+  });
+  eq(undoPaste.defaultPrevented, true, "legacy Ctrl+Z YOLO binding yields to composer undo while editing");
+  eq(textarea().value, "", "legacy Ctrl+Z YOLO binding still undoes the paste");
+  eq(yoloToggles, 0, "legacy Ctrl+Z YOLO binding does not toggle YOLO while editing");
+
+  await act(async () => {
+    saveCustomShortcut("toolApproval.yolo", { key: "z", ctrl: true, shift: true });
+    await flushTimers();
+  });
+  const legacyRedo = new window.KeyboardEvent("keydown", {
+    key: "z",
+    ctrlKey: true,
+    shiftKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  await act(async () => {
+    textarea().dispatchEvent(legacyRedo);
+    await flushTimers();
+  });
+  eq(legacyRedo.defaultPrevented, true, "legacy Ctrl+Shift+Z YOLO binding yields to composer redo while editing");
+  eq(textarea().value, "pasted", "legacy Ctrl+Shift+Z YOLO binding still redoes the paste");
+  eq(yoloToggles, 0, "legacy Ctrl+Shift+Z YOLO binding does not toggle YOLO while editing");
+
+  await act(async () => {
+    saveCustomShortcut("toolApproval.yolo", { key: "u", ctrl: true });
+    textarea().dispatchEvent(new window.KeyboardEvent("keydown", {
+      key: "z",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
     await flushTimers();
   });
   eq(textarea().value, "", "Ctrl+Z prepares a custom redo transaction after YOLO is rebound");
