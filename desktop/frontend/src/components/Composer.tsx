@@ -2440,7 +2440,7 @@ export function Composer({
     focusInputRange(0, text.length);
   };
 
-  const openInputMenu = (event: ReactMouseEvent<HTMLTextAreaElement>) => {
+  const openInputMenu = (event: ReactMouseEvent<HTMLElement>) => {
     event.preventDefault();
     event.stopPropagation();
     rememberCaret();
@@ -4121,6 +4121,7 @@ export function Composer({
                     lastSelectionRef.current = { start: selection.start, end: selection.end };
                   }}
                   onKeyDown={onKeyDown}
+                  onContextMenu={openInputMenu}
                   onPaste={onPaste}
                   onCompositionStart={() => {
                     composingRef.current = true;

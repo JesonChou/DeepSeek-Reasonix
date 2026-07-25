@@ -8,6 +8,7 @@ import {
   type CSSProperties,
   type FormEvent,
   type KeyboardEvent,
+  type MouseEvent,
 } from "react";
 import {
   invocationDisplayForCommand,
@@ -493,6 +494,7 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
   ) => void;
   onSelectionChange: (selection: RichComposerSelection, slashQuery: RichSlashQuery | null) => void;
   onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
+  onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
   onPaste: (event: ClipboardEvent<HTMLDivElement>) => void;
   onCompositionStart: () => void;
   onCompositionEnd: () => void;
@@ -505,6 +507,7 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
   onChange,
   onSelectionChange,
   onKeyDown,
+  onContextMenu,
   onPaste,
   onCompositionStart,
   onCompositionEnd,
@@ -907,6 +910,7 @@ export const RichComposerInput = forwardRef<RichComposerInputHandle, {
       onKeyUp={reportSelection}
       onClick={reportSelection}
       onFocus={reportSelection}
+      onContextMenu={onContextMenu}
       onPaste={onPaste}
     >
       {children}

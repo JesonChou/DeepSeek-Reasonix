@@ -481,6 +481,36 @@ console.log("\ncomposer goal toggle");
   if (!richInput) throw new Error("rich input disappeared after paste");
   eq(richComposerTaskText(richInput), "pasted", "paste after an invocation inserts on the token's right side");
 
+  await act(async () => {
+    richInput!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await flushTimers();
+  });
+  let richMenuItems = Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu__item"));
+  eq(richMenuItems.length, 6, "rich composer exposes the shared edit context menu");
+  ok(richMenuItems[0]?.disabled === false, "rich composer context-menu undo is enabled after paste");
+  ok(richMenuItems[1]?.disabled === true, "rich composer context-menu redo is disabled before undo");
+  await act(async () => {
+    richMenuItems[0]?.click();
+    await flushTimers();
+  });
+  richInput = document.querySelector(".composer__rich-input") as HTMLDivElement | null;
+  if (!richInput) throw new Error("rich input disappeared after context-menu undo");
+  eq(richComposerTaskText(richInput), "", "rich composer context-menu undo removes the pasted text");
+
+  await act(async () => {
+    richInput!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await flushTimers();
+  });
+  richMenuItems = Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu__item"));
+  ok(richMenuItems[1]?.disabled === false, "rich composer context-menu redo is enabled after undo");
+  await act(async () => {
+    richMenuItems[1]?.click();
+    await flushTimers();
+  });
+  richInput = document.querySelector(".composer__rich-input") as HTMLDivElement | null;
+  if (!richInput) throw new Error("rich input disappeared after context-menu redo");
+  eq(richComposerTaskText(richInput), "pasted", "rich composer context-menu redo restores the pasted text");
+
   const undoPaste = new window.KeyboardEvent("keydown", {
     key: "z",
     ctrlKey: true,
